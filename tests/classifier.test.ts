@@ -233,8 +233,9 @@ check("config: invalid regex skipped at load", () => {
 // ---------------- sensitive paths ----------------
 
 check("sensitive: ~/.ssh covers subtree", () => {
+	const home = process.env.HOME ?? "/home/user";
 	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, "~/.ssh/id_rsa"), "~/.ssh");
-	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, "/home/fujuntao/.ssh/config"), "~/.ssh");
+	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, `${home}/.ssh/config`), "~/.ssh");
 });
 
 check("sensitive: **/.env anywhere", () => {

@@ -52,13 +52,13 @@ repeated commands like `git push origin main` are judged once.
 ## Install
 
 ```bash
-pi install git:github.com/fujuntao/pi-permission-gate
+pi install git:github.com/FuJuntao/pi-permission-gate
 ```
 
 Or try it without installing:
 
 ```bash
-pi -e git:github.com/fujuntao/pi-permission-gate
+pi -e git:github.com/FuJuntao/pi-permission-gate
 ```
 
 ## Configuration
