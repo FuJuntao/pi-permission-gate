@@ -43,10 +43,26 @@ function lex(input: string): LexResult {
 	const tokens: LexToken[] = [];
 	let i = 0;
 	const n = input.length;
+	// Heredocs whose bodies must be skipped at the next newline (the body lives
+	// on following lines and would otherwise be lexed as commands).
+	const pendingHeredocs: { delim: string; stripTabs: boolean }[] = [];
 
 	while (i < n) {
+		// Newline: consume any pending heredoc bodies before resuming lexing.
+		if (input[i] === "\n") {
+			i += 1;
+			if (pendingHeredocs.length) {
+				for (const hd of pendingHeredocs) {
+					const r = skipHeredocBody(input, i, hd.delim, hd.stripTabs);
+					if (r.problem) return { tokens, problem: r.problem };
+					i = r.i;
+				}
+				pendingHeredocs.length = 0;
+			}
+			continue;
+		}
 		// Skip whitespace and line continuations.
-		if (input[i] === " " || input[i] === "\t" || input[i] === "\n" || (input[i] === "\\" && input[i + 1] === "\n")) {
+		if (input[i] === " " || input[i] === "\t" || (input[i] === "\\" && input[i + 1] === "\n")) {
 			i += input[i] === "\\" ? 2 : 1;
 			continue;
 		}
@@ -74,8 +90,21 @@ function lex(input: string): LexResult {
 		// Redirections: [n]> [n]>> [n]< << <<< >&n <&n &> &>>
 		const redir = matchRedirection(input, i);
 		if (redir) {
-			tokens.push({ text: redir.text, op: "REDIR", raw: redir.text, subs: [], quoted: false });
-			i += redir.length;
+			const kind = redirectKind(redir.text);
+			if (kind === "heredoc" && redir.text !== "<<<") {
+				// Heredoc: read the delimiter now and queue the body for skipping
+				// at the next newline. The body lives on following lines and must
+				// not be lexed as commands (it may contain (){}$() etc.).
+				const stripTabs = redir.text === "<<-";
+				const dl = readHeredocDelim(input, i + redir.length);
+				if (dl.problem) return { tokens, problem: dl.problem };
+				pendingHeredocs.push({ delim: dl.delim, stripTabs });
+				tokens.push({ text: redir.text + dl.raw, op: "REDIR", raw: redir.text + dl.raw, subs: [], quoted: false });
+				i += redir.length + dl.length;
+			} else {
+				tokens.push({ text: redir.text, op: "REDIR", raw: redir.text, subs: [], quoted: false });
+				i += redir.length;
+			}
 			continue;
 		}
 
@@ -111,11 +140,11 @@ function matchRedirection(input: string, start: number): RedirMatch | undefined 
 	if ((m = /^&>>/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	if ((m = /^&>/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	if ((m = /^>>\|?/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
-	if ((m = /^>&/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
+	if ((m = /^>&(?:[-0-9]*)/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	if ((m = /^>\|?/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	if ((m = /^<<</.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	if ((m = /^<<-?/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
-	if ((m = /^<&/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
+	if ((m = /^<&(?:[-0-9]*)/.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	if ((m = /^</.exec(rest))) return { text: fdPrefix + m[0], length: fdPrefix.length + m[0].length };
 	return fdPrefix ? undefined : undefined;
 }
@@ -292,6 +321,70 @@ function extractBacktick(input: string, start: number): SubMatch {
 		i += 1;
 	}
 	return { body, length: i - start, problem: "unterminated backtick substitution" };
+}
+
+interface HeredocDelim {
+	delim: string;
+	raw: string;
+	length: number;
+	problem?: string;
+}
+
+/**
+ * Read the heredoc delimiter following `<<` / `<<-` at `pos`. The delimiter
+ * may be unquoted (<<EOF), single- (<<'EOF') or double-quoted (<<"EOF").
+ * Returns the delimiter text, its raw source, and chars consumed from `pos`.
+ */
+function readHeredocDelim(input: string, pos: number): HeredocDelim {
+	let i = pos;
+	const n = input.length;
+	while (i < n && (input[i] === " " || input[i] === "\t")) i += 1;
+	if (i >= n) return { delim: "", raw: "", length: i - pos, problem: "missing heredoc delimiter" };
+	const c = input[i]!;
+	let delim = "";
+	let raw = "";
+	if (c === "'" || c === '"') {
+		const end = input.indexOf(c, i + 1);
+		if (end === -1) return { delim: "", raw: "", length: i - pos, problem: "unterminated quote in heredoc delimiter" };
+		delim = input.slice(i + 1, end);
+		raw = input.slice(i, end + 1);
+		i = end + 1;
+	} else {
+		while (i < n) {
+			const d = input[i]!;
+			if (d === " " || d === "\t" || d === "\n" || d === "<" || d === ">" || d === "|" || d === "&" || d === ";" || d === "#" || d === "(" || d === ")") break;
+			delim += d;
+			i += 1;
+		}
+		raw = delim;
+	}
+	if (delim === "") return { delim: "", raw, length: i - pos, problem: "missing heredoc delimiter" };
+	return { delim, raw, length: i - pos };
+}
+
+interface HeredocBody {
+	i: number;
+	problem?: string;
+}
+
+/**
+ * Skip a heredoc body starting at `start` (the first char after the newline
+ * that begins the body). Consumes lines until one equals `delim` (after
+ * stripping leading tabs when `stripTabs`, for `<<-`). Returns the index past
+ * the delimiter line, or a problem if the delimiter is never found.
+ */
+function skipHeredocBody(input: string, start: number, delim: string, stripTabs: boolean): HeredocBody {
+	let i = start;
+	const n = input.length;
+	for (;;) {
+		const nl = input.indexOf("\n", i);
+		const lineEnd = nl === -1 ? n : nl;
+		let line = input.slice(i, lineEnd);
+		if (stripTabs) line = line.replace(/^\t+/, "");
+		if (line === delim) return { i: nl === -1 ? n : nl + 1 };
+		if (nl === -1) return { i: n, problem: `unterminated heredoc '${delim}'` };
+		i = nl + 1;
+	}
 }
 
 function isAssignment(word: string): boolean {

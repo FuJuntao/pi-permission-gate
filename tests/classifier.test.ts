@@ -82,6 +82,28 @@ check("parse: fd dup is not a write", () => {
 	assert.equal(r.writes, false);
 });
 
+check("parse: 2>&1 fd number not leaked as arg", () => {
+	// Regression: the fd target (1) used to be lexed as a separate word and
+	// became a spurious positional arg.
+	const { segments } = parse("git check-ignore -v package-lock.json 2>&1");
+	const seg = segments[0]!;
+	assert.equal(seg.binary, "git");
+	assert.equal(seg.subcommand, "check-ignore");
+	assert.deepEqual(seg.args, ["package-lock.json"]);
+	assert.equal(seg.redirects.length, 1);
+	assert.equal(seg.redirects[0]!.kind, "fd-dup");
+	assert.equal(seg.redirects[0]!.writes, false);
+});
+
+check("parse: 1>&2 and <&0 fd-dup", () => {
+	const a = parse("cmd 1>&2").segments[0]!;
+	assert.equal(a.redirects[0]!.kind, "fd-dup");
+	assert.deepEqual(a.args, []);
+	const b = parse("cmd <&0").segments[0]!;
+	assert.equal(b.redirects[0]!.kind, "fd-dup");
+	assert.deepEqual(b.args, []);
+});
+
 check("parse: quoted strings preserved", () => {
 	const { segments } = parse(`grep "foo bar" 'baz qux'`);
 	// grep: first positional (the pattern) becomes subcommand, second is an arg.
@@ -108,6 +130,37 @@ check("parse: nested substitution", () => {
 
 check("parse: heredoc fails closed", () => {
 	const { problem } = parse("cat <<EOF\nhello\nEOF");
+	assert.ok(problem?.includes("heredoc"));
+});
+
+check("parse: heredoc body not lexed as commands", () => {
+	// Regression: the body used to be lexed as commands, so '(' / '{}' inside
+	// it produced a misleading "unsupported grouping" error instead of the
+	// accurate "heredoc" fail-closed result.
+	const cases = [
+		"cat > f.ts <<'EOF'\nconst { x } = loadConfig(process.cwd(), false);\nEOF",
+		"cat <<EOF\nfoo(bar)\nEOF",
+		"cat <<-EOF\n\tbody line\nEOF",
+	];
+	for (const c of cases) {
+		const { problem } = parse(c);
+		assert.ok(problem, `expected a problem for ${JSON.stringify(c)}`);
+		assert.ok(problem!.includes("heredoc"), `expected 'heredoc' in problem, got: ${problem}`);
+		assert.ok(!problem!.includes("grouping"), `body should not be lexed; got: ${problem}`);
+	}
+});
+
+check("parse: heredoc body skipped so trailing command lexes", () => {
+	// The body is skipped; the command after the delimiter is still parsed.
+	// (parse() still bails the whole line on the heredoc redirect, so this only
+	// confirms the body did not poison the lexer with a spurious error.)
+	const { problem } = parse("cat <<'EOF'\nfoo(bar)\nEOF\necho hi");
+	assert.ok(problem?.includes("heredoc"));
+	assert.ok(!problem.includes("grouping"));
+});
+
+check("parse: unterminated heredoc fails closed", () => {
+	const { problem } = parse("cat <<EOF\nbody with no end");
 	assert.ok(problem?.includes("heredoc"));
 });
 
@@ -138,6 +191,7 @@ expectClass("terraform plan -no-color", "readonly");
 expectClass("tar -tf archive.tar.gz", "readonly");
 expectClass("tar tf archive.tar", "readonly");
 expectClass("make test 2>&1 | tail -5", "mutating"); // make runs recipes (mutating)
+expectClass("git check-ignore -v package-lock.json 2>&1", "readonly");
 expectClass("git stash list", "readonly");
 expectClass("echo $(date)", "readonly");
 expectClass("jq '.dependencies' package.json", "readonly");
