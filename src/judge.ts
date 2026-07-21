@@ -10,7 +10,7 @@
  *  - Model must be explicitly configured (`judgeModel`). No silent auto-pick.
  */
 
-import { complete, getModel } from "@earendil-works/pi-ai/compat";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Analysis } from "./types.ts";
 
@@ -87,7 +87,10 @@ function parseVerdict(text: string): { safe: boolean; reason: string } | undefin
 }
 
 export interface JudgeDeps {
+	findModel: ExtensionContext["modelRegistry"]["find"];
 	getApiKeyAndHeaders: ExtensionContext["modelRegistry"]["getApiKeyAndHeaders"];
+	/** Injectable for tests; production uses pi-ai's complete(). */
+	completeRequest?: typeof complete;
 	timeoutMs: number;
 	signal?: AbortSignal;
 }
@@ -110,7 +113,9 @@ export async function judge(
 	if (slash <= 0) return undefined;
 	const provider = modelSpec.slice(0, slash);
 	const modelId = modelSpec.slice(slash + 1);
-	const model = getModel(provider as never, modelId as never);
+	// Resolve through pi's runtime registry rather than pi-ai's static built-in
+	// catalog so configured/custom providers (for example LiteLLM) work too.
+	const model = deps.findModel(provider, modelId);
 	if (!model) return undefined;
 
 	const auth = await deps.getApiKeyAndHeaders(model);
@@ -127,7 +132,7 @@ export async function judge(
 				timestamp: Date.now(),
 			},
 		];
-		const response = await complete(
+		const response = await (deps.completeRequest ?? complete)(
 			model,
 			{ systemPrompt: SYSTEM_PROMPT, messages },
 			{ apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal: deps.signal, maxTokens: 256, temperature: 0 },

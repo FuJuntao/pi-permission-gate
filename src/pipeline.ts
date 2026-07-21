@@ -215,6 +215,7 @@ async function runJudge(req: JudgeRequest, input: GateInput): Promise<JudgeVerdi
 	const cached = input.cache.get(key);
 	if (cached) return cached;
 	const verdict = await judge(input.loaded.config.judgeModel, req, {
+		findModel: (provider, modelId) => input.ctx.modelRegistry.find(provider, modelId),
 		getApiKeyAndHeaders: (m) => input.ctx.modelRegistry.getApiKeyAndHeaders(m),
 		timeoutMs: input.loaded.config.judgeTimeoutMs,
 		signal: input.ctx.signal,
