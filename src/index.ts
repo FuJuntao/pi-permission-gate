@@ -82,11 +82,13 @@ export default function (pi: ExtensionAPI) {
 			const subs = ["mode", "dry-run", "log", "stats", "config", "help"];
 			const modes = ["default", "auto", "off"];
 			const onOff = ["on", "off"];
-			const head = prefix.trim();
-			const items =
-				head.startsWith("mode ") ? modes : head.startsWith("dry-run ") ? onOff : subs;
-			const last = head.split(/\s+/).pop() ?? "";
-			const filtered = items.filter((s) => s.startsWith(last)).map((s) => ({ value: s, label: s }));
+			const nested = prefix.match(/^(mode|dry-run)\s+(.*)$/);
+			const command = nested?.[1];
+			const partial = nested?.[2] ?? prefix.trim();
+			const items = command === "mode" ? modes : command === "dry-run" ? onOff : subs;
+			const filtered = items
+				.filter((item) => item.startsWith(partial))
+				.map((item) => ({ value: command ? `${command} ${item}` : item, label: item }));
 			return filtered.length ? filtered : null;
 		},
 		handler: async (args, ctx) => {
