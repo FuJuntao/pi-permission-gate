@@ -1,9 +1,9 @@
 /**
  * Hard blocks: immutable, catastrophic-only deny patterns.
  *
- * These are checked before everything else, in every mode (including
- * observe), and cannot be extended or removed via config. The only escape
- * hatch is `hardBlocksEnabled: false` in config — a deliberate act.
+ * Checked before other policy in default/auto (including dry-run). Skipped
+ * when mode is off. Cannot be extended via config; disable with
+ * `hardBlocksEnabled: false`.
  *
  * Keep this list SHORT. Only operations that are:
  *   - catastrophic and unrecoverable (root filesystem wipe, disk format), or

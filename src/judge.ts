@@ -1,80 +1,82 @@
 /**
- * LLM judge: evaluates commands the static analyzer couldn't prove read-only.
- *
- * Design:
- *  - The judge receives the raw subject plus the parser's structured
- *    breakdown (segments, binaries, flags, redirects), allowing fail-closed
- *    syntax to remain reviewable without discarding analyzer context.
- *  - Structured JSON verdict, one retry on parse failure, then fail to the
- *    caller (which falls back to a user prompt).
- *  - Model must be explicitly configured (`judgeModel`). No silent auto-pick.
+ * LLM judge — two roles:
+ *   1. safety: T1 allow/deny (blast radius / irreversibility)
+ *   2. classify: opaque script → operation kind (+ paths when possible)
  */
 
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Analysis } from "./types.ts";
+import type { Analysis, OpKind } from "./types.ts";
 
-export interface JudgeVerdict {
+export interface SafetyVerdict {
+	role: "safety";
 	safe: boolean;
 	reason: string;
 	model: string;
 	ms: number;
 }
 
+export interface ClassifyVerdict {
+	role: "classify";
+	op?: OpKind;
+	paths: string[];
+	reason: string;
+	model: string;
+	ms: number;
+}
+
+export type JudgeVerdict = SafetyVerdict | ClassifyVerdict;
+
 export interface JudgeRequest {
 	tool: string;
-	/** Raw command (bash) or path (file tools). */
 	subject: string;
 	cwd: string;
-	/** Analyzer breakdown, present for bash. */
 	analysis?: Analysis;
-	/** Extra context for non-bash tools (e.g. file size, diff summary). */
 	extra?: string;
 }
 
-const SYSTEM_PROMPT = `You are a security judge for a coding agent's tool calls. Decide whether executing the action is safe in a development context.
+const SAFETY_PROMPT = `You are a safety judge for a coding agent's tool calls. Decide whether executing the action is acceptable in a development context.
 
-You receive the raw action plus a STRUCTURED breakdown when the static analyzer can produce one. Trust available segment analysis; for fail-closed syntax, evaluate the raw action conservatively.
+Focus on blast radius and irreversibility: data loss, destructive deletes, force-push to shared branches, production changes, host compromise, effects outside the project. Routine builds, tests, edits, installs, and commits are safe.
 
-Verdict rules:
-- "safe": true  → routine development action with bounded, reversible blast radius (build, test, install deps, format, commit, restart a dev server, write project files).
-- "safe": false → meaningful risk of data loss, secret exfiltration, irreversible remote effects, host compromise, or effects outside the working directory's project.
-Consider: destructive ops beyond generated artifacts; force-pushes to shared branches; publishing packages; touching paths outside the project; reading private keys/credentials; network posts of local data; system config changes; anything targeting production-looking resources.
-When genuinely torn, answer false.
-
-Respond with ONLY a JSON object, no markdown fences, no prose:
+Respond with ONLY a JSON object, no markdown fences:
 {"safe": true, "reason": "one sentence"}`;
 
-function buildPrompt(req: JudgeRequest): string {
+const CLASSIFY_PROMPT = `You classify what a script or opaque tool invocation does for a permission gate.
+
+Given the exact source (or tool input), return the dominant operation kind:
+- "create" — creates new files/dirs/resources
+- "read" — only observes (prints, lists, queries)
+- "update" — modifies existing content/state
+- "delete" — removes files/resources
+
+If multiple apply, pick the most dangerous: delete > update > create > read.
+Include target paths when you can infer them (relative or absolute).
+
+Respond with ONLY a JSON object, no markdown fences:
+{"op": "read"|"create"|"update"|"delete", "paths": ["optional"], "reason": "one sentence"}`;
+
+function buildSafetyPrompt(req: JudgeRequest): string {
 	const lines: string[] = [];
 	lines.push(`Tool: ${req.tool}`);
 	lines.push(`Working directory: ${req.cwd}`);
 	lines.push(`Subject: ${req.subject}`);
-
 	if (req.analysis) {
 		const a = req.analysis;
-		lines.push(`Analyzer classification: ${a.classification} (${a.note})`);
-		lines.push(`Segments:`);
+		lines.push(`Analyzer: ${a.classification} (${a.note})`);
 		for (const seg of a.segments) {
-			const parts: string[] = [`  ${seg.index + 1}. ${seg.raw}`];
-			if (seg.binary) parts.push(`binary=${seg.binary}`);
-			if (seg.subcommand) parts.push(`subcommand=${seg.subcommand}`);
-			if (seg.flags.length) parts.push(`flags=[${seg.flags.join(",")}]`);
-			if (seg.args.length) parts.push(`args=[${seg.args.join(",")}]`);
-			const writes = seg.redirects.filter((r) => r.kind === "write").map((r) => r.target);
-			if (writes.length) parts.push(`writes=[${writes.join(",")}]`);
-			if (seg.substitutions.length) parts.push(`substitutions=${seg.substitutions.length} (analyzed as read-only)`);
-			if (seg.problem) parts.push(`problem=${seg.problem}`);
-			lines.push(parts.join("  "));
+			lines.push(`  segment: ${seg.raw}`);
 		}
-		if (a.separators.length) lines.push(`Chained with: ${a.separators.join(" ")}`);
 	}
 	if (req.extra) lines.push(req.extra);
 	return lines.join("\n");
 }
 
-function parseVerdict(text: string): { safe: boolean; reason: string } | undefined {
-	// Tolerant extraction: first {...} block containing "safe".
+function buildClassifyPrompt(source: string, cwd: string, tool: string): string {
+	return [`Tool: ${tool}`, `Working directory: ${cwd}`, `Source:`, source].join("\n");
+}
+
+function parseSafety(text: string): { safe: boolean; reason: string } | undefined {
 	const match = /\{[^{}]*"safe"[^{}]*\}/s.exec(text);
 	if (!match) return undefined;
 	try {
@@ -86,55 +88,67 @@ function parseVerdict(text: string): { safe: boolean; reason: string } | undefin
 	}
 }
 
+const OPS = new Set(["create", "read", "update", "delete"]);
+
+function parseClassify(text: string): { op?: OpKind; paths: string[]; reason: string } | undefined {
+	const match = /\{[\s\S]*"op"[\s\S]*\}/s.exec(text);
+	if (!match) return undefined;
+	try {
+		const parsed = JSON.parse(match[0]) as { op?: unknown; paths?: unknown; reason?: unknown };
+		const op = typeof parsed.op === "string" && OPS.has(parsed.op) ? (parsed.op as OpKind) : undefined;
+		const paths = Array.isArray(parsed.paths) ? parsed.paths.filter((p): p is string => typeof p === "string") : [];
+		return { op, paths, reason: typeof parsed.reason === "string" ? parsed.reason : "" };
+	} catch {
+		return undefined;
+	}
+}
+
 export interface JudgeDeps {
 	findModel: ExtensionContext["modelRegistry"]["find"];
 	getApiKeyAndHeaders: ExtensionContext["modelRegistry"]["getApiKeyAndHeaders"];
-	/** Injectable for tests; production uses pi-ai's complete(). */
 	completeRequest?: typeof complete;
 	timeoutMs: number;
 	signal?: AbortSignal;
 }
 
-/**
- * Cache only exact actions in the same working directory. Security-relevant
- * details can disappear from a failed/partial parse, so a normalized analyzer
- * shape is not a safe cache identity.
- */
-export function judgeCacheKey(req: JudgeRequest): string {
-	return JSON.stringify([req.tool, req.cwd, req.subject, req.extra ?? ""]);
+export function safetyCacheKey(req: JudgeRequest): string {
+	return JSON.stringify(["safety", req.tool, req.cwd, req.subject, req.extra ?? ""]);
 }
 
-export async function judge(
+export function classifyCacheKey(tool: string, cwd: string, source: string): string {
+	return JSON.stringify(["classify", tool, cwd, source]);
+}
+
+async function callJudge(
 	modelSpec: string,
-	req: JudgeRequest,
+	systemPrompt: string,
+	userText: string,
 	deps: JudgeDeps,
-): Promise<JudgeVerdict | undefined> {
+	retryHint: string,
+	parse: (text: string) => unknown,
+): Promise<{ parsed: unknown; model: string; ms: number } | undefined> {
 	const slash = modelSpec.indexOf("/");
 	if (slash <= 0) return undefined;
 	const provider = modelSpec.slice(0, slash);
 	const modelId = modelSpec.slice(slash + 1);
-	// Resolve through pi's runtime registry rather than pi-ai's static built-in
-	// catalog so configured/custom providers (for example LiteLLM) work too.
 	const model = deps.findModel(provider, modelId);
 	if (!model) return undefined;
 
 	const auth = await deps.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) return undefined;
 
-	const prompt = buildPrompt(req);
 	const start = Date.now();
-
-	const callOnce = async (extraInstruction?: string) => {
+	const callOnce = async (extra?: string) => {
 		const messages = [
 			{
 				role: "user" as const,
-				content: [{ type: "text" as const, text: extraInstruction ? `${prompt}\n\n${extraInstruction}` : prompt }],
+				content: [{ type: "text" as const, text: extra ? `${userText}\n\n${extra}` : userText }],
 				timestamp: Date.now(),
 			},
 		];
 		const response = await (deps.completeRequest ?? complete)(
 			model,
-			{ systemPrompt: SYSTEM_PROMPT, messages },
+			{ systemPrompt, messages },
 			{ apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal: deps.signal, maxTokens: 256, temperature: 0 },
 		);
 		return response.content
@@ -158,15 +172,50 @@ export async function judge(
 	};
 
 	try {
-		const first = parseVerdict(await withTimeout(callOnce()));
-		if (first) return { ...first, model: modelSpec, ms: Date.now() - start };
-		// One retry with the parse failure fed back.
-		const second = parseVerdict(
-			await withTimeout(callOnce("Your previous reply was not valid JSON. Reply with ONLY: {\"safe\": boolean, \"reason\": string}")),
-		);
-		if (second) return { ...second, model: modelSpec, ms: Date.now() - start };
+		const first = parse(await withTimeout(callOnce()));
+		if (first) return { parsed: first, model: modelSpec, ms: Date.now() - start };
+		const second = parse(await withTimeout(callOnce(retryHint)));
+		if (second) return { parsed: second, model: modelSpec, ms: Date.now() - start };
 		return undefined;
 	} catch {
 		return undefined;
 	}
 }
+
+export async function judgeSafety(modelSpec: string, req: JudgeRequest, deps: JudgeDeps): Promise<SafetyVerdict | undefined> {
+	const result = await callJudge(
+		modelSpec,
+		SAFETY_PROMPT,
+		buildSafetyPrompt(req),
+		deps,
+		'Reply with ONLY: {"safe": boolean, "reason": string}',
+		parseSafety,
+	);
+	if (!result) return undefined;
+	const v = result.parsed as { safe: boolean; reason: string };
+	return { role: "safety", safe: v.safe, reason: v.reason, model: result.model, ms: result.ms };
+}
+
+export async function judgeClassify(
+	modelSpec: string,
+	tool: string,
+	cwd: string,
+	source: string,
+	deps: JudgeDeps,
+): Promise<ClassifyVerdict | undefined> {
+	const result = await callJudge(
+		modelSpec,
+		CLASSIFY_PROMPT,
+		buildClassifyPrompt(source, cwd, tool),
+		deps,
+		'Reply with ONLY: {"op": "read"|"create"|"update"|"delete", "paths": [], "reason": string}',
+		parseClassify,
+	);
+	if (!result) return undefined;
+	const v = result.parsed as { op?: OpKind; paths: string[]; reason: string };
+	return { role: "classify", op: v.op, paths: v.paths, reason: v.reason, model: result.model, ms: result.ms };
+}
+
+/** @deprecated alias for tests */
+export const judge = judgeSafety;
+export const judgeCacheKey = safetyCacheKey;

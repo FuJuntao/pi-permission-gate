@@ -2,32 +2,39 @@
  * Shared types for the permission gate pipeline.
  */
 
+/** CRUD operation kind inferred from a tool call. */
+export type OpKind = "create" | "read" | "update" | "delete";
+
+/** Policy tier after path/op context is applied. */
+export type Tier = "T0" | "T1" | "T2";
+
 /** Which pipeline stage produced the final decision. */
 export type DecisionStage =
+	| "off"
 	| "hard-block"
 	| "config-deny"
 	| "config-allow"
-	| "analyzer-readonly"
-	| "analyzer-mutating"
-	| "git-tracked-edit"
-	| "session-edit"
+	| "tier-t2"
+	| "tier-t0"
 	| "judge"
 	| "user-prompt"
 	| "no-ui"
-	| "observe";
+	| "dry-run";
 
 /** Final verdict of the pipeline. */
 export type Verdict = "allow" | "block";
 
 /** Gate operating mode. */
-export type Mode = "auto" | "observe" | "strict";
+export type Mode = "default" | "auto" | "off";
 
 export interface Decision {
 	verdict: Verdict;
 	stage: DecisionStage;
 	reason: string;
-	/** Set in observe mode: what the verdict would have been in auto/strict. */
+	/** Set in dry-run: what the verdict would have been when enforcing. */
 	wouldBe?: Verdict;
+	op?: OpKind;
+	tier?: Tier;
 }
 
 /** A single simple command parsed out of a compound shell command line. */
@@ -62,9 +69,9 @@ export interface Redirect {
 	writes: boolean;
 }
 
-/** Result of analyzing a full command line. */
+/** Result of analyzing a full command line (shell parser + command DB). */
 export interface Analysis {
-	/** Overall classification of the whole command line. */
+	/** Legacy shell classification used by the analyzer internals. */
 	classification: "readonly" | "mutating" | "unknown";
 	segments: Segment[];
 	/** Separators between segments, e.g. ["&&", "|"]. */
@@ -76,18 +83,22 @@ export interface Analysis {
 /** Merged configuration (defaults → global → project). */
 export interface GateConfig {
 	mode: Mode;
+	/** When true, classify as mode but only enforce hard blocks; record wouldBe. */
+	dryRun: boolean;
 	/** "provider/model-id" for the LLM judge. Empty string = not configured. */
 	judgeModel: string;
-	/** Run the judge asynchronously in observe mode and log its verdict. */
-	judgeInObserveMode: boolean;
-	/** Hard blocks apply even in observe mode. */
+	/** Write every decision to logPath. */
+	audit: boolean;
+	/** Hard blocks apply in default/auto (including dry-run). */
 	hardBlocksEnabled: boolean;
-	/** Regex strings matched against the full command; allow wins unless denied. */
+	/** Glob patterns for freely creatable/readable files. */
+	allowedFiles: string[];
+	/** Wildcard patterns matched against the tool subject; allow wins unless denied. */
 	allow: string[];
-	/** Regex strings matched against the full command; deny always beats allow. */
+	/** Wildcard patterns matched against the tool subject; deny always beats allow. */
 	deny: string[];
-	/** Glob-ish path patterns that file tools and bash path targets must not touch. */
-	sensitivePaths: string[];
+	/** Glob patterns for credential-like paths (U/D → T1). */
+	protectedPaths: string[];
 	/** Audit log file path (supports ~). */
 	logPath: string;
 	/** Judge request timeout in milliseconds. */
@@ -95,13 +106,15 @@ export interface GateConfig {
 }
 
 export const DEFAULT_CONFIG: GateConfig = {
-	mode: "auto",
+	mode: "default",
+	dryRun: false,
 	judgeModel: "",
-	judgeInObserveMode: true,
+	audit: false,
 	hardBlocksEnabled: true,
+	allowedFiles: ["**/*"],
 	allow: [],
 	deny: [],
-	sensitivePaths: [
+	protectedPaths: [
 		"~/.ssh",
 		"~/.gnupg",
 		"~/.aws",
@@ -127,11 +140,14 @@ export interface AuditEntry {
 	/** The command or path being gated. */
 	subject: string;
 	mode: Mode;
+	dryRun?: boolean;
 	stage: DecisionStage;
 	verdict: Verdict;
-	/** Present in observe mode: what would have happened. */
+	/** Present in dry-run: what would have happened when enforcing. */
 	wouldBe?: Verdict;
 	reason: string;
+	op?: OpKind;
+	tier?: Tier;
 	/** Analyzer breakdown for tuning. */
 	analysis?: {
 		classification: Analysis["classification"];
@@ -146,13 +162,14 @@ export interface AuditEntry {
 			problem?: string;
 		}>;
 	};
-	/** Judge details when the judge ran (sync or observe-async). */
+	/** Judge details when the judge ran. */
 	judge?: {
 		model: string;
-		safe: boolean;
+		safe?: boolean;
+		op?: OpKind;
 		reason: string;
 		ms: number;
-		async: boolean;
+		role: "safety" | "classify";
 	};
 	userChoice?: string;
 }

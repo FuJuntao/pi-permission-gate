@@ -1,34 +1,18 @@
 /**
  * Analyzer test suite: parser + classifier, fail-closed behavior,
- * hard blocks, config rules, sensitive paths.
- *
- * Run: node --experimental-strip-types tests/classifier.test.ts
- * (or via: npm test)
+ * hard blocks, config rules, protected paths.
  */
 
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import { classifyCommand } from "../src/analyzer/classifier.ts";
 import { parse } from "../src/analyzer/shell-parser.ts";
 import { matchHardBlock } from "../src/hard-blocks.ts";
-import { matchConfigRules, matchSensitivePath } from "../src/config.ts";
+import { matchConfigRules, matchProtectedPath } from "../src/config.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 
-let passed = 0;
-let failed = 0;
-const failures: string[] = [];
-
-function check(name: string, fn: () => void) {
-	try {
-		fn();
-		passed++;
-	} catch (e) {
-		failed++;
-		failures.push(`${name}: ${(e as Error).message}`);
-	}
-}
-
 function expectClass(cmd: string, expected: "readonly" | "mutating" | "unknown") {
-	check(`classify ${JSON.stringify(cmd)} → ${expected}`, () => {
+	test(`classify ${JSON.stringify(cmd)} → ${expected}`, () => {
 		const a = classifyCommand(cmd);
 		assert.equal(
 			a.classification,
@@ -42,47 +26,47 @@ function expectClass(cmd: string, expected: "readonly" | "mutating" | "unknown")
 
 // ---------------- parser sanity ----------------
 
-check("parse: simple command", () => {
+test("parse: simple command", () => {
 	const { segments } = parse("git status");
 	assert.equal(segments.length, 1);
 	assert.equal(segments[0]!.binary, "git");
 	assert.equal(segments[0]!.subcommand, "status");
 });
 
-check("parse: bundled flags split", () => {
+test("parse: bundled flags split", () => {
 	const { segments } = parse("rm -rf dist/");
 	assert.deepEqual(segments[0]!.flags.sort(), ["-f", "-r"]);
 	assert.deepEqual(segments[0]!.args, ["dist/"]);
 });
 
-check("parse: pipe splits segments", () => {
+test("parse: pipe splits segments", () => {
 	const { segments, separators } = parse("cat foo | grep bar | wc -l");
 	assert.equal(segments.length, 3);
 	assert.deepEqual(separators, ["|", "|"]);
 	assert.equal(segments[1]!.binary, "grep");
 });
 
-check("parse: && and ; separators", () => {
+test("parse: && and ; separators", () => {
 	const { segments, separators } = parse("npm test && git status; ls");
 	assert.equal(segments.length, 3);
 	assert.deepEqual(separators, ["&&", ";"]);
 });
 
-check("parse: write redirect captured", () => {
+test("parse: write redirect captured", () => {
 	const { segments } = parse("echo hello > out.txt");
 	assert.equal(segments[0]!.redirects.length, 1);
 	assert.equal(segments[0]!.redirects[0]!.kind, "write");
 	assert.equal(segments[0]!.redirects[0]!.target, "out.txt");
 });
 
-check("parse: fd dup is not a write", () => {
+test("parse: fd dup is not a write", () => {
 	const { segments } = parse("make test 2>&1 | tail -5");
 	const r = segments[0]!.redirects[0]!;
 	assert.equal(r.kind, "fd-dup");
 	assert.equal(r.writes, false);
 });
 
-check("parse: 2>&1 fd number not leaked as arg", () => {
+test("parse: 2>&1 fd number not leaked as arg", () => {
 	// Regression: the fd target (1) used to be lexed as a separate word and
 	// became a spurious positional arg.
 	const { segments } = parse("git check-ignore -v package-lock.json 2>&1");
@@ -95,7 +79,7 @@ check("parse: 2>&1 fd number not leaked as arg", () => {
 	assert.equal(seg.redirects[0]!.writes, false);
 });
 
-check("parse: 1>&2 and <&0 fd-dup", () => {
+test("parse: 1>&2 and <&0 fd-dup", () => {
 	const a = parse("cmd 1>&2").segments[0]!;
 	assert.equal(a.redirects[0]!.kind, "fd-dup");
 	assert.deepEqual(a.args, []);
@@ -104,36 +88,36 @@ check("parse: 1>&2 and <&0 fd-dup", () => {
 	assert.deepEqual(b.args, []);
 });
 
-check("parse: quoted strings preserved", () => {
+test("parse: quoted strings preserved", () => {
 	const { segments } = parse(`grep "foo bar" 'baz qux'`);
 	// grep: first positional (the pattern) becomes subcommand, second is an arg.
 	assert.equal(segments[0]!.subcommand, "foo bar");
 	assert.deepEqual(segments[0]!.args, ["baz qux"]);
 });
 
-check("parse: leading env assignment", () => {
+test("parse: leading env assignment", () => {
 	const { segments } = parse("FOO=bar NODE_ENV=test npm run build");
 	assert.equal(segments[0]!.env.FOO, "bar");
 	assert.equal(segments[0]!.env.NODE_ENV, "test");
 	assert.equal(segments[0]!.binary, "npm");
 });
 
-check("parse: substitution collected", () => {
+test("parse: substitution collected", () => {
 	const { segments } = parse("echo $(date +%Y)");
 	assert.deepEqual(segments[0]!.substitutions, ["date +%Y"]);
 });
 
-check("parse: nested substitution", () => {
+test("parse: nested substitution", () => {
 	const { segments } = parse("echo $(foo $(bar))");
 	assert.deepEqual(segments[0]!.substitutions, ["foo $(bar)"]);
 });
 
-check("parse: heredoc fails closed", () => {
+test("parse: heredoc fails closed", () => {
 	const { problem } = parse("cat <<EOF\nhello\nEOF");
 	assert.ok(problem?.includes("heredoc"));
 });
 
-check("parse: heredoc body not lexed as commands", () => {
+test("parse: heredoc body not lexed as commands", () => {
 	// Regression: the body used to be lexed as commands, so '(' / '{}' inside
 	// it produced a misleading "unsupported grouping" error instead of the
 	// accurate "heredoc" fail-closed result.
@@ -150,7 +134,7 @@ check("parse: heredoc body not lexed as commands", () => {
 	}
 });
 
-check("parse: heredoc body skipped so trailing command lexes", () => {
+test("parse: heredoc body skipped so trailing command lexes", () => {
 	// The body is skipped; the command after the delimiter is still parsed.
 	// (parse() still bails the whole line on the heredoc redirect, so this only
 	// confirms the body did not poison the lexer with a spurious error.)
@@ -159,12 +143,12 @@ check("parse: heredoc body skipped so trailing command lexes", () => {
 	assert.ok(!problem.includes("grouping"));
 });
 
-check("parse: unterminated heredoc fails closed", () => {
+test("parse: unterminated heredoc fails closed", () => {
 	const { problem } = parse("cat <<EOF\nbody with no end");
 	assert.ok(problem?.includes("heredoc"));
 });
 
-check("parse: unterminated quote fails closed", () => {
+test("parse: unterminated quote fails closed", () => {
 	const { problem } = parse(`echo "foo`);
 	assert.ok(problem?.includes("unterminated"));
 });
@@ -249,63 +233,53 @@ expectClass("env FOO=1 node server.js", "unknown");
 
 // ---------------- hard blocks ----------------
 
-check("hard block: rm -rf /", () => assert.ok(matchHardBlock("rm -rf /")));
-check("hard block: rm -rf /*", () => assert.ok(matchHardBlock("rm -rf /*")));
-check("hard block: rm -rf ~", () => assert.ok(matchHardBlock("rm -rf ~")));
-check("hard block: rm -rf $HOME", () => assert.ok(matchHardBlock("rm -rf $HOME")));
-check("hard block: rm -rf --no-preserve-root /", () => assert.ok(matchHardBlock("rm -rf --no-preserve-root /")));
-check("hard block: fork bomb", () => assert.ok(matchHardBlock(":(){ :|:& };:")));
-check("hard block: fork bomb spaced", () => assert.ok(matchHardBlock(": ( ) { : | : & } ; :")));
-check("hard block: mkfs /dev/sda", () => assert.ok(matchHardBlock("mkfs.ext4 /dev/sda1")));
-check("hard block: dd of=/dev/nvme", () => assert.ok(matchHardBlock("dd if=img.iso of=/dev/nvme0n1 bs=4M")));
-check("hard block: redirect to /dev/sda", () => assert.ok(matchHardBlock("cat img.iso > /dev/sda")));
-check("hard block: shred device", () => assert.ok(matchHardBlock("shred /dev/sdb")));
+test("hard block: rm -rf /", () => assert.ok(matchHardBlock("rm -rf /")));
+test("hard block: rm -rf /*", () => assert.ok(matchHardBlock("rm -rf /*")));
+test("hard block: rm -rf ~", () => assert.ok(matchHardBlock("rm -rf ~")));
+test("hard block: rm -rf $HOME", () => assert.ok(matchHardBlock("rm -rf $HOME")));
+test("hard block: rm -rf --no-preserve-root /", () => assert.ok(matchHardBlock("rm -rf --no-preserve-root /")));
+test("hard block: fork bomb", () => assert.ok(matchHardBlock(":(){ :|:& };:")));
+test("hard block: fork bomb spaced", () => assert.ok(matchHardBlock(": ( ) { : | : & } ; :")));
+test("hard block: mkfs /dev/sda", () => assert.ok(matchHardBlock("mkfs.ext4 /dev/sda1")));
+test("hard block: dd of=/dev/nvme", () => assert.ok(matchHardBlock("dd if=img.iso of=/dev/nvme0n1 bs=4M")));
+test("hard block: redirect to /dev/sda", () => assert.ok(matchHardBlock("cat img.iso > /dev/sda")));
+test("hard block: shred device", () => assert.ok(matchHardBlock("shred /dev/sdb")));
 
 // these must NOT hard-block
-check("no hard block: rm -rf dist/", () => assert.equal(matchHardBlock("rm -rf dist/"), undefined));
-check("no hard block: rm -rf /tmp/build", () => assert.equal(matchHardBlock("rm -rf /tmp/build"), undefined));
-check("no hard block: rm -rf ~/tmp", () => assert.equal(matchHardBlock("rm -rf ~/tmp"), undefined));
-check("no hard block: dd of=file.img", () => assert.equal(matchHardBlock("dd if=/dev/zero of=file.img"), undefined));
-check("no hard block: ls /", () => assert.equal(matchHardBlock("ls /"), undefined));
+test("no hard block: rm -rf dist/", () => assert.equal(matchHardBlock("rm -rf dist/"), undefined));
+test("no hard block: rm -rf /tmp/build", () => assert.equal(matchHardBlock("rm -rf /tmp/build"), undefined));
+test("no hard block: rm -rf ~/tmp", () => assert.equal(matchHardBlock("rm -rf ~/tmp"), undefined));
+test("no hard block: dd of=file.img", () => assert.equal(matchHardBlock("dd if=/dev/zero of=file.img"), undefined));
+test("no hard block: ls /", () => assert.equal(matchHardBlock("ls /"), undefined));
 
 // ---------------- config rules ----------------
 
-check("config: deny beats allow", () => {
-	const cfg = { ...DEFAULT_CONFIG, allow: ["^git"], deny: ["push.*--force"] };
+test("config: deny beats allow", () => {
+	const cfg = { ...DEFAULT_CONFIG, allow: ["git *"], deny: ["git push *--force*"] };
 	assert.equal(matchConfigRules(cfg, "git status"), "allow");
-	assert.equal(matchConfigRules(cfg, "git push --force"), "deny");
+	assert.equal(matchConfigRules(cfg, "git push origin --force"), "deny");
 	assert.equal(matchConfigRules(cfg, "npm test"), undefined);
 });
 
-check("config: invalid regex skipped at load", () => {
-	// direct call with a bad pattern should throw — validateRegexes guards at load;
-	// here we just confirm valid usage works.
-	const cfg = { ...DEFAULT_CONFIG, allow: ["^ls\\b"] };
+test("config: wildcard allow", () => {
+	const cfg = { ...DEFAULT_CONFIG, allow: ["ls *"] };
 	assert.equal(matchConfigRules(cfg, "ls -la"), "allow");
 });
 
-// ---------------- sensitive paths ----------------
+// ---------------- protected paths ----------------
 
-check("sensitive: ~/.ssh covers subtree", () => {
+test("protected: ~/.ssh covers subtree", () => {
 	const home = process.env.HOME ?? "/home/user";
-	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, "~/.ssh/id_rsa"), "~/.ssh");
-	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, `${home}/.ssh/config`), "~/.ssh");
+	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "~/.ssh/id_rsa"), "~/.ssh");
+	assert.equal(matchProtectedPath(DEFAULT_CONFIG, `${home}/.ssh/config`), "~/.ssh");
 });
 
-check("sensitive: **/.env anywhere", () => {
-	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, "/repo/app/.env"), "**/.env");
-	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, "/repo/.env.production"), "**/.env.*");
+test("protected: **/.env anywhere", () => {
+	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "/repo/app/.env"), "**/.env");
+	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "/repo/.env.production"), "**/.env.*");
 });
 
-check("sensitive: normal project file is fine", () => {
-	assert.equal(matchSensitivePath(DEFAULT_CONFIG.sensitivePaths, "/repo/src/index.ts"), undefined);
+test("protected: normal project file is fine", () => {
+	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "/repo/src/index.ts"), undefined);
 });
 
-// ---------------- summary ----------------
-
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failures.length) {
-	console.log("\nFailures:");
-	for (const f of failures) console.log("  ✗ " + f);
-	process.exit(1);
-}

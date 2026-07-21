@@ -1,28 +1,21 @@
 /**
- * Permission Gate
- *
- * Auto-mode permission pipeline for pi tool calls:
- *   hard blocks → config rules → static read-only analysis → LLM judge → prompt
- * with an observe mode that logs decisions without blocking, for tuning.
+ * Permission Gate — CRUD + tier pipeline for pi tool calls.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { appendAudit, readAudit } from "./audit.ts";
+import { readAudit } from "./audit.ts";
 import { loadConfig, type LoadedConfig } from "./config.ts";
-import { FileEditPolicy } from "./file-edit-policy.ts";
 import { decide } from "./pipeline.ts";
 import type { JudgeVerdict } from "./judge.ts";
 import type { AuditEntry, Mode } from "./types.ts";
 
 const STATUS_KEY = "perm-gate";
-const SESSION_FILE_ENTRY = "permission-gate-session-file";
-const MODE_ICON: Record<Mode, string> = { auto: "🛡", observe: "👁", strict: "🔒" };
+const MODE_ICON: Record<Mode, string> = { default: "🛡", auto: "⚡", off: "⏸" };
 
 export default function (pi: ExtensionAPI) {
 	let loaded: LoadedConfig | undefined;
 	let sessionId: string | undefined;
 	const judgeCache = new Map<string, JudgeVerdict>();
-	const fileEditPolicy = new FileEditPolicy();
 
 	const reload = (ctx: ExtensionContext) => {
 		loaded = loadConfig(ctx.cwd, ctx.isProjectTrusted());
@@ -31,17 +24,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		reload(ctx);
 		sessionId = ctx.sessionManager.getSessionId();
-		fileEditPolicy.clear();
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type !== "custom" || entry.customType !== SESSION_FILE_ENTRY) continue;
-			const path = (entry.data as { path?: unknown } | undefined)?.path;
-			if (typeof path === "string") fileEditPolicy.restore(path);
-		}
+		judgeCache.clear();
 		updateStatus(ctx);
 		const { config } = loaded!;
 		if (config.mode === "auto" && !config.judgeModel) {
 			ctx.ui.notify(
-				"permission-gate: auto mode with no judgeModel configured — non-read-only commands will prompt. Set judgeModel in ~/.pi/agent/permission-gate.json",
+				"permission-gate: auto mode with no judgeModel — T1 actions will be denied. Set judgeModel in ~/.pi/agent/permission-gate.json",
 				"warning",
 			);
 		}
@@ -49,24 +37,26 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		judgeCache.clear();
-		fileEditPolicy.clear();
 	});
 
 	function updateStatus(ctx: ExtensionContext) {
 		if (!loaded) return;
-		const { mode, judgeModel } = loaded.config;
-		const judge = mode === "auto" ? (judgeModel ? ` +judge` : " (no judge)") : "";
-		ctx.ui.setStatus(STATUS_KEY, `${MODE_ICON[mode]} gate:${mode}${judge}`);
+		const { mode, dryRun, judgeModel } = loaded.config;
+		if (mode === "off") {
+			ctx.ui.setStatus(STATUS_KEY, `${MODE_ICON.off} gate:off`);
+			return;
+		}
+		const judge = judgeModel ? " +judge" : " (no judge)";
+		const dry = dryRun ? " dry-run" : "";
+		ctx.ui.setStatus(STATUS_KEY, `${MODE_ICON[mode]} gate:${mode}${dry}${judge}`);
 	}
-
-	// ---------- tool gating ----------
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (!loaded) reload(ctx);
 		const l = loaded!;
 
 		const subject = subjectFor(event.toolName, event.input as Record<string, unknown>);
-		if (subject === undefined) return undefined; // tool we don't gate
+		if (subject === undefined) return undefined;
 
 		const decision = await decide({
 			tool: event.toolName,
@@ -75,15 +65,10 @@ export default function (pi: ExtensionAPI) {
 			loaded: l,
 			sessionId,
 			cache: judgeCache,
-			fileEditPolicy,
-			onAsyncJudge: (entry, verdict) => {
-				appendAudit(l.config.logPath, entry);
-				if (!verdict.safe) ctx.ui.notify(`observe: judge would have blocked — ${verdict.reason}`, "warning");
-			},
 		});
 
-		if (decision.wouldBe === "block" && decision.stage === "observe") {
-			ctx.ui.notify(`observe: would have blocked — ${decision.reason}`, "warning");
+		if (decision.wouldBe === "block") {
+			ctx.ui.notify(`dry-run: would have blocked — ${decision.reason}`, "warning");
 		}
 		if (decision.verdict === "block") {
 			return { block: true, reason: `permission-gate: ${decision.reason}` };
@@ -91,23 +76,17 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	});
 
-	pi.on("tool_result", async (event, ctx) => {
-		if (!ctx.isProjectTrusted() || event.isError || (event.toolName !== "write" && event.toolName !== "edit")) return;
-		const path = (event.input as { path?: unknown }).path;
-		if (typeof path !== "string") return;
-		const canonicalPath = await fileEditPolicy.rememberSuccessfulMutation(event.toolName, path, ctx.cwd);
-		if (canonicalPath) pi.appendEntry(SESSION_FILE_ENTRY, { path: canonicalPath });
-	});
-
-	// ---------- /gate command ----------
-
 	pi.registerCommand("gate", {
-		description: "Permission gate: /gate [mode|log|stats|config|help]",
+		description: "Permission gate: /gate [mode|dry-run|log|stats|config|help]",
 		getArgumentCompletions: (prefix) => {
-			const subs = ["mode", "log", "stats", "config", "help"];
-			const modes = ["auto", "observe", "strict"];
-			const items = (prefix.startsWith("mode ") ? modes : subs).map((s) => ({ value: s, label: s }));
-			const filtered = items.filter((i) => i.value.startsWith(prefix.split(" ").pop() ?? ""));
+			const subs = ["mode", "dry-run", "log", "stats", "config", "help"];
+			const modes = ["default", "auto", "off"];
+			const onOff = ["on", "off"];
+			const head = prefix.trim();
+			const items =
+				head.startsWith("mode ") ? modes : head.startsWith("dry-run ") ? onOff : subs;
+			const last = head.split(/\s+/).pop() ?? "";
+			const filtered = items.filter((s) => s.startsWith(last)).map((s) => ({ value: s, label: s }));
 			return filtered.length ? filtered : null;
 		},
 		handler: async (args, ctx) => {
@@ -119,19 +98,38 @@ export default function (pi: ExtensionAPI) {
 				case "mode": {
 					const next = rest[0] as Mode | undefined;
 					if (!next) {
-						ctx.ui.notify(`mode: ${l.config.mode} (usage: /gate mode auto|observe|strict)`, "info");
+						ctx.ui.notify(`mode: ${l.config.mode} (usage: /gate mode default|auto|off)`, "info");
 						return;
 					}
-					if (next !== "auto" && next !== "observe" && next !== "strict") {
-						ctx.ui.notify(`unknown mode '${next}' — use auto|observe|strict`, "error");
+					if (next !== "default" && next !== "auto" && next !== "off") {
+						ctx.ui.notify(`unknown mode '${next}' — use default|auto|off`, "error");
 						return;
 					}
-					l.config.mode = next; // session-scoped; persist by editing config file
+					l.config.mode = next;
 					updateStatus(ctx);
 					ctx.ui.notify(`permission-gate mode → ${next} (session only; edit permission-gate.json to persist)`, "info");
 					return;
 				}
+				case "dry-run": {
+					const next = rest[0];
+					if (!next) {
+						ctx.ui.notify(`dry-run: ${l.config.dryRun ? "on" : "off"} (usage: /gate dry-run on|off)`, "info");
+						return;
+					}
+					if (next !== "on" && next !== "off") {
+						ctx.ui.notify(`usage: /gate dry-run on|off`, "error");
+						return;
+					}
+					l.config.dryRun = next === "on";
+					updateStatus(ctx);
+					ctx.ui.notify(`permission-gate dry-run → ${next} (session only)`, "info");
+					return;
+				}
 				case "log": {
+					if (!l.config.audit) {
+						ctx.ui.notify(`audit is off — set "audit": true in permission-gate.json`, "info");
+						return;
+					}
 					const entries = readAudit(l.config.logPath, 50);
 					if (entries.length === 0) {
 						ctx.ui.notify(`no audit entries yet (${l.config.logPath})`, "info");
@@ -141,6 +139,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "stats": {
+					if (!l.config.audit) {
+						ctx.ui.notify(`audit is off — set "audit": true in permission-gate.json`, "info");
+						return;
+					}
 					const entries = readAudit(l.config.logPath, 2000);
 					ctx.ui.notify(buildStats(entries), "info");
 					return;
@@ -152,8 +154,9 @@ export default function (pi: ExtensionAPI) {
 				default: {
 					ctx.ui.notify(
 						[
-							"/gate mode [auto|observe|strict] — show or set mode (session)",
-							"/gate log — recent decisions",
+							"/gate mode [default|auto|off] — show or set mode (session)",
+							"/gate dry-run [on|off] — show or set dry-run (session)",
+							"/gate log — recent decisions (requires audit)",
 							"/gate stats — decision breakdown",
 							"/gate config — merged config + file paths",
 						].join("\n"),
@@ -171,10 +174,8 @@ function subjectFor(tool: string, input: Record<string, unknown>): string | unde
 		return typeof input.path === "string" ? input.path : undefined;
 	}
 	if (tool === "grep" || tool === "find" || tool === "ls") {
-		// Read-only by design; the pipeline still runs them through sensitive-path checks.
 		return typeof input.path === "string" ? input.path : "";
 	}
-	// Unknown/custom tools: gate on a serialized form.
 	return JSON.stringify(input).slice(0, 500);
 }
 
@@ -182,10 +183,11 @@ function formatConfig(l: LoadedConfig): string {
 	const c = l.config;
 	return [
 		`mode: ${c.mode}`,
+		`dryRun: ${c.dryRun}`,
 		`judgeModel: ${c.judgeModel || "(not configured)"}`,
-		`judgeInObserveMode: ${c.judgeInObserveMode}`,
+		`audit: ${c.audit}`,
 		`hardBlocksEnabled: ${c.hardBlocksEnabled}`,
-		`allow rules: ${c.allow.length} · deny rules: ${c.deny.length} · sensitive paths: ${c.sensitivePaths.length}`,
+		`allowedFiles: ${c.allowedFiles.length} · allow: ${c.allow.length} · deny: ${c.deny.length} · protected: ${c.protectedPaths.length}`,
 		`log: ${c.logPath}`,
 		`global config: ${l.globalPath}`,
 		`project config: ${l.projectPath ?? "(none / untrusted)"}`,
@@ -201,9 +203,12 @@ function verdictMark(e: AuditEntry): string {
 function showLog(entries: AuditEntry[], ctx: ExtensionContext) {
 	const lines = entries.map((e) => {
 		const time = new Date(e.ts).toLocaleTimeString();
-		const judge = e.judge ? ` judge:${e.judge.safe ? "safe" : "unsafe"}(${e.judge.ms}ms${e.judge.async ? ",async" : ""})` : "";
+		const judge = e.judge
+			? ` judge:${e.judge.role}${e.judge.safe === false ? ":unsafe" : e.judge.safe === true ? ":safe" : ""}${e.judge.op ? `:${e.judge.op}` : ""}(${e.judge.ms}ms)`
+			: "";
+		const meta = [e.op, e.tier].filter(Boolean).join("/");
 		const subject = e.subject.length > 80 ? e.subject.slice(0, 77) + "…" : e.subject;
-		return `${time} ${verdictMark(e)} [${e.stage}] ${subject}${judge}`;
+		return `${time} ${verdictMark(e)} [${e.stage}${meta ? ` ${meta}` : ""}] ${subject}${judge}`;
 	});
 	ctx.ui.notify(lines.join("\n"), "info");
 }
@@ -224,7 +229,10 @@ function buildStats(entries: AuditEntry[]): string {
 		}
 	}
 	const fmt = (m: Map<string, number>) =>
-		[...m.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `  ${k}: ${v}`).join("\n");
+		[...m.entries()]
+			.sort((a, b) => b[1] - a[1])
+			.map(([k, v]) => `  ${k}: ${v}`)
+			.join("\n");
 	return [
 		`${entries.length} decisions`,
 		`by verdict:\n${fmt(byVerdict)}`,

@@ -24,6 +24,6 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --experimental-strip-types tests/classifier.test.ts && node --experimental-strip-types tests/judge.test.ts && node --experimental-strip-types tests/pipeline.test.ts && node --experimental-strip-types tests/file-edit-policy.test.ts"
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
   }
 }

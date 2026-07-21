@@ -1,6 +1,5 @@
 /**
- * Append-only JSONL audit log. Every gate decision is recorded — this is
- * the data source for observe-mode tuning (/gate stats, /gate tune).
+ * Append-only JSONL audit log. Written when config.audit is true.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";

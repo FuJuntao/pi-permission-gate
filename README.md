@@ -1,74 +1,171 @@
 # pi-permission-gate
 
 A [pi](https://github.com/earendil-works/pi-mono) extension that gates tool
-calls through a multi-stage permission pipeline, with an **auto mode** that
-uses static analysis + an LLM judge to decide whether a command is safe
-without prompting on every action.
+calls so agents can loop fast while catastrophic operations stay blocked.
+
+**Design goals**
+
+- Prefer speed: routine create/read/update work should not interrupt the agent.
+- Prevent catastrophe: hard blocks for weaponized commands; cautious delete.
+- Credential-related paths are *protected*: for U/D they are **T1**.
 
 ## How it works
 
-Every gated tool call flows through this pipeline (cheapest stage first):
+Every gated tool call flows through this pipeline:
 
 ```
 tool_call
-  └─► 1. hard blocks        immutable, all modes (rm -rf /, mkfs /dev/sd*, fork bombs, ...)
-  └─► 2. config rules       allow/deny regexes + sensitive-path globs
-  └─► 3. file edit policy   allow edits to tracked files or files mutated this session
-  └─► 4. static analyzer    hand-rolled shell parser + command DB
-         ├─ provably read-only  ─► allow
-         ├─ mutating / unknown  ─► continue
-  └─► 5. LLM judge          light model evaluates the analyzer's structured breakdown
-  └─► 6. user prompt        fallback when the judge can't decide (or no judge configured)
+  └─► 1. classify            map the call to C | R | U | D (or unknown)
+  └─► 2. hard blocks         immutable catastrophic denies (default / auto)
+  └─► 3. custom rules        wildcard allow / deny (deny wins)
+  └─► 4. assign tier         T2 | T1 | T0 from op + path context
+  └─► 5. apply tier
+         ├─ T2 ─► allow
+         ├─ T1 ─► LLM judge  (see Modes)
+         └─ T0 ─► prompt (default) / deny (auto)
+  └─► 6. user prompt         when the mode/tier requires it
 ```
 
-In **observe mode** the pipeline runs identically but never blocks (except
-hard blocks). Definite rule denials and unsafe asynchronous judge verdicts
-are reported without claiming that pending judgments would have blocked.
+### Operation kinds (CRUD)
 
-### The static analyzer
+| Kind | Meaning | Examples |
+|------|---------|----------|
+| **C** Create | Creates a new file/dir/resource | `write` new path, `mkdir`, `touch` |
+| **R** Read | Observes without changing state | `read`, `grep`, `ls`, `cat`, `git status` |
+| **U** Update | Modifies existing content/state | `edit`, `sed -i`, overwrite `write` |
+| **D** Delete | Removes files/resources | `rm`, `git rm`, `unlink` |
 
-A fail-closed shell parser (`src/analyzer/shell-parser.ts`) understands a
-useful subset of shell grammar — pipelines, `&&`/`;`, redirections, command
-substitutions, leading `VAR=val` assignments — and marks anything outside
-that subset as `unanalyzable` so it routes to the judge rather than being
-guessed. The command database (`src/analyzer/command-db.ts`) knows which
-binaries are read-only, flag-dependent (`sed -i`, `find -delete`), or
-always mutating, plus subcommand maps for `git`, `npm`, `docker`,
-`kubectl`, `terraform`, etc.
+Compound shell commands take the **most dangerous** kind among segments
+(`D > U > C > R`).
 
-Substitutions are analyzed recursively: `echo $(rm -rf dist)` is **not**
-read-only just because `echo` is.
+**Opaque invocations** are interpreter or script launches whose real work
+lives in a referenced file or inline source — e.g. `python script.py`,
+`python -c '...'`, `node -e`, `bash other.sh`. Classification:
 
-### File edit policy
+1. Load the script or inline source (file on disk, `-c` / `-e` payload,
+   simple heredoc body).
+2. Send that **exact source** to the LLM judge to classify operation kind
+   (C / R / U / D) and target paths when possible. The result enters the
+   normal tier matrix (and may then take a T1 safety judgment if the tier
+   is T1).
+3. When the body cannot be loaded, or the judge cannot return a kind,
+   assign **T0**.
 
-In trusted projects, `edit` is allowed for Git-tracked regular files after
-sensitive-path and symlink checks. A successful `write` or `edit` of another
-regular project file grants later `edit` calls for that file in the same
-session. Grants are restored on reload/resume, but reads never create grants
-and `write` always requires its normal judgment.
+Dynamic shells with no recoverable body (`eval` of computed strings,
+unknown binaries without a script argument) use step 3.
+
+Ordinary bash is classified by the static shell analyzer (parser + command
+DB). File tools are classified from the tool name and whether the target
+path already exists. Opaque script bodies go to the judge for kind
+classification.
+
+### Hard blocks
+
+A short, immutable list of catastrophic patterns (e.g. `rm -rf /`, fork
+bombs, `mkfs` / `dd` to raw disks). Enforced in `default` and `auto`
+(including dry-run). Skipped when `mode` is `off`.
+`hardBlocksEnabled: false` disables them when needed.
+
+### Custom rules (wildcards)
+
+`allow` and `deny` use **wildcard** matching (`*`, `**`, `?`) against the
+tool subject (command string or path).
+
+- Deny always beats allow.
+- Rules are checked after hard blocks and before tier assignment.
+- Choosing **Always allow** / **Always allow similar** in a prompt appends a
+  rule to the **global** config (`~/.pi/agent/permission-gate.json`).
+
+### Tiers
+
+| Tier | Meaning |
+|------|---------|
+| **T2** | Pass — no judge, no prompt |
+| **T1** | LLM judge decides |
+| **T0** | No judge — human prompt (`default`) or auto-deny (`auto`) |
+
+### Path context for U and D
+
+First matching rule wins:
+
+1. **Protected path** → **T1**
+2. **Gitignored** → **T1**
+3. **Matches `allowedFiles` and git-tracked** → **T2**
+4. **Else** → **T0**
+
+**Protected paths** are globs for credential- and auth-related locations
+(`~/.ssh`, `**/.env`, `**/*.pem`, …). For **U** and **D**, a matching path
+is **T1**. **C** and **R** use the `allowedFiles` rules below.
+
+### Create and Read
+
+| Op | Path matches `allowedFiles` | No match |
+|----|------------------------------|----------|
+| **R** | T2 | T0 |
+| **C** | T2 | T0 |
 
 ### The LLM judge
 
-When the analyzer can't prove a command read-only, the judge evaluates the
-raw subject together with the parser's **structured breakdown** (segments,
-binaries, flags, redirects, chained-with). This lets it handle fail-closed
-constructs without asking it to reconstruct ordinary shell grammar.
+Used in two roles:
 
-Verdicts are cached per exact tool, working directory, and subject for the
-session. Repeated identical actions are judged once, while partially parsed
-commands can never share a security verdict.
+1. **T1 allow/deny (or prompt)** — blast radius / irreversibility, using the
+   analyzer’s structured breakdown when available.
+2. **Opaque op classification** — for interpreter/script bodies, the judge
+   receives the **exact source** and returns an operation kind (C/R/U/D)
+   plus target paths when possible; that result feeds the normal tier
+   matrix (and may then require a T1 safety judgment if the tier is T1).
 
-## Install
+Verdicts are cached per exact tool, cwd, and subject for the session.
 
-```bash
-pi install git:github.com/FuJuntao/pi-permission-gate
-```
+### User prompt
 
-Or try it without installing:
+When a human decision is required, options are:
 
-```bash
-pi -e git:github.com/FuJuntao/pi-permission-gate
-```
+1. **Allow once** — this call only
+2. **Always allow** — append an exact-match wildcard rule to global config
+3. **Always allow similar** — append a broader wildcard rule (suggested from
+   the subject; user confirms)
+4. **Deny** — block this call
+
+## Modes
+
+| Mode | T2 | T1 | T0 | Human attention |
+|------|----|----|-----|-----------------|
+| **default** | Pass | Judge → allow **or prompt** | Always prompt | When needed |
+| **auto** | Pass | Judge → allow **or deny** | Auto-deny | None |
+| **off** | — | — | — | None (passthrough) |
+
+Config default: `"mode": "default"`.
+
+- **`default`** — interactive gate: fast on T2, judge on T1, ask on T0.
+- **`auto`** — unattended: never prompts; T1 is judge-final; T0 is denied.
+- **`off`** — every tool call passes through; no classification, judge,
+  prompt, hard blocks, or custom rules.
+
+**Dry-run** (`"dryRun": true`) applies to **default** and **auto** only
+(ignored when `mode` is `off`). It keeps that mode’s classification and
+judge behavior, records what the verdict **would be**, and only enforces
+hard blocks.
+
+| Combo | What you are testing |
+|-------|----------------------|
+| `default` | live interactive gate |
+| `auto` | live unattended gate |
+| `default` + `dryRun` | would prompt vs allow under default |
+| `auto` + `dryRun` | would deny vs allow under auto |
+| `off` | gate disabled |
+
+Runtime (session-scoped; persist via config):
+
+- `/gate mode default|auto|off`
+- `/gate dry-run on|off`
+
+**Judge model:** must be explicitly configured (`judgeModel`). If missing:
+
+- **default** — T1 falls through to prompt.
+- **auto** — T1 is denied; warn on session start.
+- **dryRun** — same would-be outcomes as the active mode above.
+- **off** — judge is unused.
 
 ## Configuration
 
@@ -83,68 +180,134 @@ loosen global guards):
 
 ```jsonc
 {
-  "mode": "auto",                 // "auto" | "observe" | "strict"
-  "judgeModel": "anthropic/claude-haiku-4-5",  // required for auto mode; "provider/model-id"
-  "judgeInObserveMode": true,     // run judge async in observe mode for tuning data
-  "hardBlocksEnabled": true,      // immutable catastrophic blocks; escape hatch
-  "allow": ["^git (status|diff|log)"],   // regex, checked after hard blocks
-  "deny":  ["^docker system prune"],     // regex, deny always beats allow
-  "sensitivePaths": ["~/.ssh", "**/.env", "**/auth.json"],
+  // How the gate behaves:
+  //   "default" — ask when unsure
+  //   "auto"    — never ask; judge decides or denies
+  //   "off"     — disable the gate
+  "mode": "default",
+
+  // Preview decisions without blocking (except catastrophic hard blocks).
+  // Ignored when mode is "off".
+  "dryRun": false,
+
+  // Model used to judge risky actions. Format: "provider/model-id".
+  "judgeModel": "anthropic/claude-haiku-4-5",
+
+  // Write every decision to the audit log file.
+  "audit": false,
+
+  // Block catastrophic commands like `rm -rf /`. Set false to disable.
+  "hardBlocksEnabled": true,
+
+  // Files the agent may freely create/read (glob patterns).
+  // Updates/deletes on these paths are also easier to auto-approve when git-tracked.
+  "allowedFiles": ["**/*"],
+
+  // Always allow matching commands or paths (wildcard patterns).
+  "allow": ["git status", "git diff *"],
+
+  // Always deny matching commands or paths (wildcard patterns). Deny wins over allow.
+  "deny": ["docker system prune*"],
+
+  // Credential-like paths. Updates and deletes here always go through the judge.
+  "protectedPaths": [
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "**/.env",
+    "**/.env.*",
+    "**/auth.json",
+    "~/.pi/agent/auth.json",
+    "**/id_rsa",
+    "**/id_ed25519",
+    "**/*.pem",
+    "**/*.key"
+  ],
+
+  // Where to write the audit log (used when audit is true).
   "logPath": "~/.pi/agent/permission-gate.log",
+
+  // How long to wait for the judge before falling back (milliseconds).
   "judgeTimeoutMs": 15000
 }
 ```
 
-**The judge model must be explicitly configured.** With `mode: "auto"` but
-no `judgeModel`, non-read-only commands fall back to a user prompt (same as
-strict) and a warning fires on session start. No silent auto-pick.
+**Always allow / Always allow similar** always append to the **global**
+`allow` list, even when a project config layer is present.
 
-## Modes
-
-- **`auto`** — full pipeline. Read-only commands pass silently; mutating/
-  unknown commands go to the judge, then a prompt on uncertainty.
-- **`observe`** — pipeline runs but nothing is blocked (except hard blocks).
-  Every decision is logged, plus the judge's async verdict when configured.
-  Warnings are shown only for definite rule denials or unsafe judge verdicts.
-- **`strict`** — no judge. Read-only actions and trusted tracked/session edits
-  still pass; everything else mutating or unknown prompts the user.
-
-Switch at runtime with `/gate mode auto|observe|strict` (session-scoped;
-edit the config file to persist).
+Lists (`allow`, `deny`, `allowedFiles`, `protectedPaths`) merge as
+additive unions across layers. Project config may enable
+`hardBlocksEnabled` when the merged global value is false; it cannot
+disable hard blocks that the global layer left enabled. Project config may
+set `mode` to `default` or `auto`, but only the global layer may set
+`mode` to `off`.
 
 ## Commands
 
-- `/gate mode [auto|observe|strict]` — show or set the mode (session only)
-- `/gate log` — recent decisions with verdict colors
+- `/gate mode [default|auto|off]` — show or set the mode (session only)
+- `/gate dry-run [on|off]` — show or set dry-run (session only; ignored when mode is off)
+- `/gate log` — recent decisions with verdict colors (requires `audit`)
 - `/gate stats` — decision breakdown by stage/verdict, judge latency
 - `/gate config` — merged config + file paths
 - `/gate help` — usage
 
-A footer status line shows the current mode: `🛡 gate:auto +judge`.
+A footer status line shows the current state, e.g. `🛡 gate:default +judge`,
+`🛡 gate:auto dry-run`, or `🛡 gate:off`.
 
 ## Audit log
 
-Append-only JSONL at `~/.pi/agent/permission-gate.log` (configurable). One
-line per decision, including the analyzer breakdown and judge details — the
-data source for observe-mode tuning. Rotates at 5MB (keeps the last 1MB).
+When `"audit": true`, every decision under **default** or **auto** (with or
+without dry-run) is appended as JSONL to `logPath` (default
+`~/.pi/agent/permission-gate.log`). Each line includes op kind, tier,
+analyzer breakdown, judge details, and `wouldBe` when `dryRun` is on. The
+file rotates at 5MB (keeps the last 1MB).
+
+When `"audit": false`, decisions are not written to disk (`/gate log` /
+`/gate stats` stay empty). Dry-run still classifies and judges for
+in-session would-be outcomes; disk recording is controlled only by `audit`.
+Mode `off` produces no audit entries.
 
 ## Tool coverage
 
 | Tool | Handling |
 |------|----------|
-| `bash` | full pipeline (parser + judge) |
-| `read` / `grep` / `find` / `ls` | sensitive-path check, else allow |
-| `edit` | sensitive-path check; in trusted projects, tracked regular files and files successfully mutated this session are allowed; otherwise judge |
-| `write` | sensitive-path check, then judge; successful project writes grant later `edit` calls for that session |
-| unknown/custom tools | treated as unknown → judge or prompt per mode |
+| `bash` | classify via shell analyzer → full pipeline |
+| `bash` opaque (`python` / `node` / nested scripts, …) | load source → judge classifies op kind → tier matrix |
+| `read` / `grep` / `find` / `ls` | **R** → tier by `allowedFiles` glob |
+| `write` (new path) | **C** → tier by `allowedFiles` glob |
+| `write` (existing) / `edit` | **U** → path tiering |
+| delete-like bash (`rm`, …) | **D** → path tiering |
+| unknown / custom tools | recover input body when possible → same opaque path; else T0 |
+
+## Decision matrix (summary)
+
+```
+mode off?                      → allow (passthrough)
+Hard block?                    → deny
+Wildcard deny?                 → deny
+Wildcard allow?                → allow
+
+R/C  matches allowedFiles      → T2
+R/C  no match                  → T0
+
+U/D  protected                 → T1
+U/D  gitignored                → T1
+U/D  allowedFiles + tracked    → T2
+U/D  else                      → T0
+
+opaque → load source → judge-classify kind → matrix above;
+         unresolved kind → T0
+
+Then: T2 allow | T1 judge (per mode) | T0 prompt or deny (per mode)
+      dryRun → allow (except hard blocks) + record wouldBe
+```
 
 ## Development
 
 ```bash
-cd main
 npm install
 npm run check   # tsc --noEmit
-npm test        # analyzer, pipeline, judge-cache, and file-edit-policy tests
+npm test        # node:test
 ```
 
 ## License
