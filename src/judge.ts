@@ -2,9 +2,9 @@
  * LLM judge: evaluates commands the static analyzer couldn't prove read-only.
  *
  * Design:
- *  - The judge NEVER sees just a raw command blob. It receives the parser's
- *    structured breakdown (segments, binaries, flags, redirects) so it only
- *    reasons about risk, never about shell grammar.
+ *  - The judge receives the raw subject plus the parser's structured
+ *    breakdown (segments, binaries, flags, redirects), allowing fail-closed
+ *    syntax to remain reviewable without discarding analyzer context.
  *  - Structured JSON verdict, one retry on parse failure, then fail to the
  *    caller (which falls back to a user prompt).
  *  - Model must be explicitly configured (`judgeModel`). No silent auto-pick.
@@ -34,7 +34,7 @@ export interface JudgeRequest {
 
 const SYSTEM_PROMPT = `You are a security judge for a coding agent's tool calls. Decide whether executing the action is safe in a development context.
 
-You receive a STRUCTURED breakdown produced by a static analyzer, never just a raw command. Trust the segment analysis; reason only about risk.
+You receive the raw action plus a STRUCTURED breakdown when the static analyzer can produce one. Trust available segment analysis; for fail-closed syntax, evaluate the raw action conservatively.
 
 Verdict rules:
 - "safe": true  → routine development action with bounded, reversible blast radius (build, test, install deps, format, commit, restart a dev server, write project files).
@@ -95,13 +95,13 @@ export interface JudgeDeps {
 	signal?: AbortSignal;
 }
 
-/** Cache key: normalized so re-judging the same structure is free. */
+/**
+ * Cache only exact actions in the same working directory. Security-relevant
+ * details can disappear from a failed/partial parse, so a normalized analyzer
+ * shape is not a safe cache identity.
+ */
 export function judgeCacheKey(req: JudgeRequest): string {
-	if (!req.analysis) return `${req.tool}:${req.subject}`;
-	const shape = req.analysis.segments
-		.map((s) => `${s.binary ?? "?"}:${s.subcommand ?? ""}:${s.flags.join(",")}:${s.args.join(",")}:${s.redirects.filter((r) => r.kind === "write").map((r) => r.target).join(",")}`)
-		.join("|");
-	return `${req.tool}:${shape}`;
+	return JSON.stringify([req.tool, req.cwd, req.subject, req.extra ?? ""]);
 }
 
 export async function judge(

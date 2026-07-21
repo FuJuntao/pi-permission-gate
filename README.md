@@ -13,16 +13,17 @@ Every gated tool call flows through this pipeline (cheapest stage first):
 tool_call
   └─► 1. hard blocks        immutable, all modes (rm -rf /, mkfs /dev/sd*, fork bombs, ...)
   └─► 2. config rules       allow/deny regexes + sensitive-path globs
-  └─► 3. static analyzer    hand-rolled shell parser + command DB
+  └─► 3. file edit policy   allow edits to tracked files or files mutated this session
+  └─► 4. static analyzer    hand-rolled shell parser + command DB
          ├─ provably read-only  ─► allow
          ├─ mutating / unknown  ─► continue
-  └─► 4. LLM judge           light model evaluates the analyzer's structured breakdown
-  └─► 5. user prompt         fallback when the judge can't decide (or no judge configured)
+  └─► 5. LLM judge          light model evaluates the analyzer's structured breakdown
+  └─► 6. user prompt        fallback when the judge can't decide (or no judge configured)
 ```
 
 In **observe mode** the pipeline runs identically but never blocks (except
-hard blocks); every decision is logged with what *would have* happened, so
-you can tune your config before trusting auto mode.
+hard blocks). Definite rule denials and unsafe asynchronous judge verdicts
+are reported without claiming that pending judgments would have blocked.
 
 ### The static analyzer
 
@@ -38,16 +39,24 @@ always mutating, plus subcommand maps for `git`, `npm`, `docker`,
 Substitutions are analyzed recursively: `echo $(rm -rf dist)` is **not**
 read-only just because `echo` is.
 
+### File edit policy
+
+In trusted projects, `edit` is allowed for Git-tracked regular files after
+sensitive-path and symlink checks. A successful `write` or `edit` of another
+regular project file grants later `edit` calls for that file in the same
+session. Grants are restored on reload/resume, but reads never create grants
+and `write` always requires its normal judgment.
+
 ### The LLM judge
 
-When the analyzer can't prove a command read-only, the judge evaluates it.
-The judge never receives a raw command blob — it gets the parser's
-**structured breakdown** (segments, binaries, flags, redirects, chained-with)
-so it only reasons about risk, not shell grammar. This keeps the prompt
-small and the success rate high.
+When the analyzer can't prove a command read-only, the judge evaluates the
+raw subject together with the parser's **structured breakdown** (segments,
+binaries, flags, redirects, chained-with). This lets it handle fail-closed
+constructs without asking it to reconstruct ordinary shell grammar.
 
-Verdicts are cached per normalized command structure for the session, so
-repeated commands like `git push origin main` are judged once.
+Verdicts are cached per exact tool, working directory, and subject for the
+session. Repeated identical actions are judged once, while partially parsed
+commands can never share a security verdict.
 
 ## Install
 
@@ -95,10 +104,10 @@ strict) and a warning fires on session start. No silent auto-pick.
 - **`auto`** — full pipeline. Read-only commands pass silently; mutating/
   unknown commands go to the judge, then a prompt on uncertainty.
 - **`observe`** — pipeline runs but nothing is blocked (except hard blocks).
-  Every decision is logged with what *would* have happened, plus the judge's
-  async verdict when configured. Use this to tune before trusting auto.
-- **`strict`** — no judge, no auto-allow beyond config rules; everything
-  mutating/unknown prompts the user.
+  Every decision is logged, plus the judge's async verdict when configured.
+  Warnings are shown only for definite rule denials or unsafe judge verdicts.
+- **`strict`** — no judge. Read-only actions and trusted tracked/session edits
+  still pass; everything else mutating or unknown prompts the user.
 
 Switch at runtime with `/gate mode auto|observe|strict` (session-scoped;
 edit the config file to persist).
@@ -125,7 +134,8 @@ data source for observe-mode tuning. Rotates at 5MB (keeps the last 1MB).
 |------|----------|
 | `bash` | full pipeline (parser + judge) |
 | `read` / `grep` / `find` / `ls` | sensitive-path check, else allow |
-| `write` / `edit` | sensitive-path check, then judge in auto mode |
+| `edit` | sensitive-path check; in trusted projects, tracked regular files and files successfully mutated this session are allowed; otherwise judge |
+| `write` | sensitive-path check, then judge; successful project writes grant later `edit` calls for that session |
 | unknown/custom tools | treated as unknown → judge or prompt per mode |
 
 ## Development
@@ -134,7 +144,7 @@ data source for observe-mode tuning. Rotates at 5MB (keeps the last 1MB).
 cd main
 npm install
 npm run check   # tsc --noEmit
-npm test        # 99 analyzer/classifier/hard-block/config tests
+npm test        # analyzer, pipeline, judge-cache, and file-edit-policy tests
 ```
 
 ## License

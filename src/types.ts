@@ -9,6 +9,8 @@ export type DecisionStage =
 	| "config-allow"
 	| "analyzer-readonly"
 	| "analyzer-mutating"
+	| "git-tracked-edit"
+	| "session-edit"
 	| "judge"
 	| "user-prompt"
 	| "no-ui"

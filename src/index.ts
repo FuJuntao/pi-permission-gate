@@ -9,17 +9,20 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { appendAudit, readAudit } from "./audit.ts";
 import { loadConfig, type LoadedConfig } from "./config.ts";
+import { FileEditPolicy } from "./file-edit-policy.ts";
 import { decide } from "./pipeline.ts";
 import type { JudgeVerdict } from "./judge.ts";
 import type { AuditEntry, Mode } from "./types.ts";
 
 const STATUS_KEY = "perm-gate";
+const SESSION_FILE_ENTRY = "permission-gate-session-file";
 const MODE_ICON: Record<Mode, string> = { auto: "🛡", observe: "👁", strict: "🔒" };
 
 export default function (pi: ExtensionAPI) {
 	let loaded: LoadedConfig | undefined;
 	let sessionId: string | undefined;
 	const judgeCache = new Map<string, JudgeVerdict>();
+	const fileEditPolicy = new FileEditPolicy();
 
 	const reload = (ctx: ExtensionContext) => {
 		loaded = loadConfig(ctx.cwd, ctx.isProjectTrusted());
@@ -28,6 +31,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		reload(ctx);
 		sessionId = ctx.sessionManager.getSessionId();
+		fileEditPolicy.clear();
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== SESSION_FILE_ENTRY) continue;
+			const path = (entry.data as { path?: unknown } | undefined)?.path;
+			if (typeof path === "string") fileEditPolicy.restore(path);
+		}
 		updateStatus(ctx);
 		const { config } = loaded!;
 		if (config.mode === "auto" && !config.judgeModel) {
@@ -40,6 +49,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		judgeCache.clear();
+		fileEditPolicy.clear();
 	});
 
 	function updateStatus(ctx: ExtensionContext) {
@@ -65,8 +75,10 @@ export default function (pi: ExtensionAPI) {
 			loaded: l,
 			sessionId,
 			cache: judgeCache,
-			onAsyncJudge: (entry) => {
+			fileEditPolicy,
+			onAsyncJudge: (entry, verdict) => {
 				appendAudit(l.config.logPath, entry);
+				if (!verdict.safe) ctx.ui.notify(`observe: judge would have blocked — ${verdict.reason}`, "warning");
 			},
 		});
 
@@ -77,6 +89,14 @@ export default function (pi: ExtensionAPI) {
 			return { block: true, reason: `permission-gate: ${decision.reason}` };
 		}
 		return undefined;
+	});
+
+	pi.on("tool_result", async (event, ctx) => {
+		if (!ctx.isProjectTrusted() || event.isError || (event.toolName !== "write" && event.toolName !== "edit")) return;
+		const path = (event.input as { path?: unknown }).path;
+		if (typeof path !== "string") return;
+		const canonicalPath = await fileEditPolicy.rememberSuccessfulMutation(event.toolName, path, ctx.cwd);
+		if (canonicalPath) pi.appendEntry(SESSION_FILE_ENTRY, { path: canonicalPath });
 	});
 
 	// ---------- /gate command ----------

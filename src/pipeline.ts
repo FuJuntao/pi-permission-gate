@@ -1,11 +1,12 @@
 /**
  * Decision pipeline. Every gated tool call flows through:
  *
- *   1. hard blocks      (immutable, all modes)
+ *   1. hard blocks       (immutable, all modes)
  *   2. config allow/deny (command regexes + sensitive paths)
- *   3. static analyzer  (provably read-only? → allow)
- *   4. LLM judge        (auto mode + configured model; async-log in observe)
- *   5. user prompt      (strict mode, or auto when judge can't decide)
+ *   3. file edit policy  (tracked or session-granted edits → allow)
+ *   4. static analyzer   (provably read-only? → allow)
+ *   5. LLM judge         (auto mode + configured model; async-log in observe)
+ *   6. user prompt       (strict mode, or auto when judge can't decide)
  *
  * Observe mode runs the same stages but converts the final verdict to
  * "allow + log what would have happened".
@@ -16,6 +17,7 @@ import { appendAudit } from "./audit.ts";
 import { classifyCommand } from "./analyzer/classifier.ts";
 import { matchConfigRules, matchSensitivePath, type LoadedConfig } from "./config.ts";
 import { matchHardBlock } from "./hard-blocks.ts";
+import type { FileEditPolicy } from "./file-edit-policy.ts";
 import { judge, judgeCacheKey, type JudgeRequest, type JudgeVerdict } from "./judge.ts";
 import type { Analysis, AuditEntry, Decision } from "./types.ts";
 
@@ -28,6 +30,8 @@ export interface GateInput {
 	sessionId?: string;
 	/** Session-scoped judge verdict cache. */
 	cache: Map<string, JudgeVerdict>;
+	/** Git-tracked and session-scoped edit authorization. */
+	fileEditPolicy: FileEditPolicy;
 	/** Fire-and-forget judge runner for observe mode. */
 	onAsyncJudge?: (entry: AuditEntry, verdict: JudgeVerdict) => void;
 }
@@ -42,6 +46,9 @@ export async function decide(input: GateInput): Promise<Decision> {
 
 	const finish = (decision: Decision, analysis?: Analysis, judgeInfo?: AuditEntry["judge"], userChoice?: string): Decision => {
 		const observed = mode === "observe";
+		// Observe mode bypasses ordinary denials for tuning, but catastrophic hard
+		// blocks remain enforced in every mode.
+		const bypassedBlock = observed && decision.verdict === "block" && decision.stage !== "hard-block";
 		const entry: AuditEntry = {
 			ts: Date.now(),
 			session: input.sessionId,
@@ -50,8 +57,8 @@ export async function decide(input: GateInput): Promise<Decision> {
 			subject,
 			mode,
 			stage: decision.stage,
-			verdict: observed ? "allow" : decision.verdict,
-			wouldBe: observed ? decision.verdict : undefined,
+			verdict: bypassedBlock ? "allow" : decision.verdict,
+			wouldBe: bypassedBlock ? "block" : decision.wouldBe,
 			reason: decision.reason,
 			analysis: analysis
 				? {
@@ -72,7 +79,7 @@ export async function decide(input: GateInput): Promise<Decision> {
 			userChoice,
 		};
 		appendAudit(loaded.config.logPath, entry);
-		if (observed && decision.verdict === "block") {
+		if (bypassedBlock) {
 			return { verdict: "allow", stage: "observe", reason: decision.reason, wouldBe: "block" };
 		}
 		return decision;
@@ -111,6 +118,17 @@ export async function decide(input: GateInput): Promise<Decision> {
 	// ---- Read-only file tools: allow after config ----
 	if (READONLY_TOOLS.has(tool)) {
 		return finish({ verdict: "allow", stage: "analyzer-readonly", reason: "read-only tool" });
+	}
+
+	// ---- Tracked/session file edits: allow after sensitive-path checks ----
+	if (tool === "edit" && ctx.isProjectTrusted()) {
+		const allowance = await input.fileEditPolicy.allowance(tool, subject, ctx.cwd);
+		if (allowance === "git-tracked") {
+			return finish({ verdict: "allow", stage: "git-tracked-edit", reason: "edit target is a Git-tracked regular file" });
+		}
+		if (allowance === "session") {
+			return finish({ verdict: "allow", stage: "session-edit", reason: "file was successfully mutated earlier in this session" });
+		}
 	}
 
 	// ---- Stage 3: static analysis (bash) ----
@@ -172,7 +190,9 @@ export async function decide(input: GateInput): Promise<Decision> {
 			tool === "bash"
 				? `observe: analyzer said ${analysis?.classification ?? "n/a"} (${analysis?.note ?? ""})`
 				: `observe: ${tool} would require judgment`;
-		return finish({ verdict: "allow", stage: "observe", reason, wouldBe: "block" }, analysis);
+		// The asynchronous judge has not produced a verdict yet. Do not claim the
+		// command would be blocked; onAsyncJudge reports the eventual result.
+		return finish({ verdict: "allow", stage: "observe", reason }, analysis);
 	}
 
 	// ---- Stage 4: judge (auto mode only) ----

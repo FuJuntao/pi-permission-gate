@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { judge } from "../src/judge.ts";
+import { judge, judgeCacheKey } from "../src/judge.ts";
+import { classifyCommand } from "../src/analyzer/classifier.ts";
 
 const dynamicModel = {
 	provider: "lite-llm",
@@ -40,4 +41,23 @@ assert.equal(verdict?.safe, true);
 assert.equal(verdict?.reason, "bounded project edit");
 assert.equal(verdict?.model, "lite-llm/deepseek-v4-flash");
 
-console.log("\n1 passed, 0 failed");
+const safeHeredoc = "python3 - <<'PY'\nprint('safe')\nPY";
+const destructiveHeredoc = "python3 - <<'PY'\nimport shutil; shutil.rmtree('.')\nPY";
+const cacheRequest = (subject: string) => ({
+	tool: "bash",
+	subject,
+	cwd: "/repo",
+	analysis: classifyCommand(subject),
+});
+assert.notEqual(
+	judgeCacheKey(cacheRequest(safeHeredoc)),
+	judgeCacheKey(cacheRequest(destructiveHeredoc)),
+	"different parse-failed commands must never share a judge verdict",
+);
+assert.notEqual(
+	judgeCacheKey(cacheRequest(safeHeredoc)),
+	judgeCacheKey({ ...cacheRequest(safeHeredoc), cwd: "/other-repo" }),
+	"relative commands in different working directories must not share a judge verdict",
+);
+
+console.log("\n3 passed, 0 failed");
