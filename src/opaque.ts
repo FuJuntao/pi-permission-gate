@@ -3,8 +3,8 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
 import type { Analysis, Segment } from "./types.ts";
+import { resolveAgainst } from "./paths.ts";
 
 const OPAQUE_BINS = new Set([
 	"perl",
@@ -36,8 +36,16 @@ export function isOpaqueBinary(bin: string): boolean {
  * Prefers inline `-c`/`-e` payloads, then script file contents, then heredoc bodies.
  */
 export function extractOpaqueSource(command: string, analysis: Analysis, cwd: string): string | undefined {
+	// Track the effective cwd by following `cd`/`pushd` so a script launched
+	// after a cd (e.g. `cd /tmp && node t.mjs`) is found where it actually runs,
+	// not under the session cwd.
+	let curCwd = cwd;
 	for (const seg of analysis.segments) {
-		const src = sourceFromSegment(seg, cwd);
+		if ((seg.binary === "cd" || seg.binary === "pushd") && !seg.problem && seg.subcommand) {
+			curCwd = resolveAgainst(seg.subcommand, curCwd);
+			continue;
+		}
+		const src = sourceFromSegment(seg, curCwd);
 		if (src) return src;
 	}
 	// Heredoc: python <<'EOF' ... EOF
@@ -59,7 +67,7 @@ function sourceFromSegment(seg: Segment, cwd: string): string | undefined {
 	// Script file: python script.py / bash other.sh
 	const fileArg = firstScriptArg(seg);
 	if (fileArg) {
-		const full = resolve(cwd, fileArg);
+		const full = resolveAgainst(fileArg, cwd);
 		if (existsSync(full)) {
 			try {
 				return readFileSync(full, "utf8");

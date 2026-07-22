@@ -4,6 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { decide } from "../src/pipeline.ts";
+import { classifyCommand } from "../src/analyzer/classifier.ts";
+import { extractOpaqueSource } from "../src/opaque.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 
 const logPath = "/tmp/pi-permission-gate-pipeline-test.log";
@@ -193,5 +195,33 @@ describe("disposable paths (e.g. /tmp)", () => {
 		const d = await decideAuto("rm -f /etc/foo");
 		assert.equal(d.tier, "T0");
 		assert.equal(d.verdict, "block");
+	});
+});
+
+describe("extractOpaqueSource follows cd", () => {
+	let root: string;
+
+	before(() => {
+		root = mkdtempSync(join(import.meta.dirname, ".tmp-opaque-"));
+		writeFileSync(join(root, "script.mjs"), "console.log('opaque body');\n");
+	});
+	after(() => {
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("script found via cd'd cwd, not session cwd", () => {
+		// Session cwd is "/" (script.mjs does NOT exist there); the command cd's
+		// into `root` first, so the script must be resolved under `root`.
+		const command = `cd ${root} && node script.mjs`;
+		const analysis = classifyCommand(command);
+		const src = extractOpaqueSource(command, analysis, "/");
+		assert.equal(src, "console.log('opaque body');\n");
+	});
+
+	test("without cd, script is not found under session cwd", () => {
+		const command = "node script.mjs";
+		const analysis = classifyCommand(command);
+		const src = extractOpaqueSource(command, analysis, "/");
+		assert.equal(src, undefined);
 	});
 });
