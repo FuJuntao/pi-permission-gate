@@ -47,6 +47,49 @@ const DB: Record<string, CommandRule> = {
 	yq: { behavior: "readonly", writeFlags: ["-i", "--inplace"] },
 	xsv: { behavior: "readonly" },
 	pwd: { behavior: "readonly" },
+	// ----- shell builtins (no FS mutation relevant to safety) -----
+	// `cd`/`pushd`/`popd` only change the shell cwd; the gate analyzes the
+	// whole compound command, so `cd X && rm Y` still classifies `rm` as
+	// mutating on its own segment. Marking these readonly keeps `cd X && <ro>`
+	// from being tainted unknown. Path resolution follows `cd` (see classify-op).
+	cd: { behavior: "readonly" },
+	pushd: { behavior: "readonly" },
+	popd: { behavior: "readonly" },
+	export: { behavior: "readonly" },
+	set: { behavior: "readonly" },
+	unset: { behavior: "readonly" },
+	alias: { behavior: "readonly" },
+	unalias: { behavior: "readonly" },
+	umask: { behavior: "readonly" },
+	hash: { behavior: "readonly" },
+	history: { behavior: "readonly" },
+	read: { behavior: "readonly" },
+	wait: { behavior: "readonly" },
+	jobs: { behavior: "readonly" },
+	fg: { behavior: "readonly" },
+	bg: { behavior: "readonly" },
+	disown: { behavior: "readonly" },
+	builtin: { behavior: "readonly" },
+	":": { behavior: "readonly" },
+	// Shell keywords. Prefix keywords (if/elif/while/until/do/then/else/!/`{`)
+	// are stripped by the parser so the real command is analyzed; the rest are
+	// structural no-ops. Listed here so a bare keyword token is a readonly
+	// no-op instead of "no command word".
+	for: { behavior: "readonly" },
+	function: { behavior: "readonly" },
+	done: { behavior: "readonly" },
+	fi: { behavior: "readonly" },
+	esac: { behavior: "readonly" },
+	"}": { behavior: "readonly" },
+	if: { behavior: "readonly" },
+	elif: { behavior: "readonly" },
+	while: { behavior: "readonly" },
+	until: { behavior: "readonly" },
+	do: { behavior: "readonly" },
+	then: { behavior: "readonly" },
+	else: { behavior: "readonly" },
+	"!": { behavior: "readonly" },
+	"{": { behavior: "readonly" },
 	echo: { behavior: "readonly" },
 	printf: { behavior: "readonly" },
 	true: { behavior: "readonly" },

@@ -93,6 +93,8 @@ export interface GateConfig {
 	hardBlocksEnabled: boolean;
 	/** Glob patterns for freely creatable/readable files. */
 	allowedFiles: string[];
+	/** Root directories whose contents are disposable (U/D -> T2). */
+	disposablePaths: string[];
 	/** Wildcard patterns matched against the tool subject; allow wins unless denied. */
 	allow: string[];
 	/** Wildcard patterns matched against the tool subject; deny always beats allow. */
@@ -112,6 +114,7 @@ export const DEFAULT_CONFIG: GateConfig = {
 	audit: false,
 	hardBlocksEnabled: true,
 	allowedFiles: ["**/*"],
+	disposablePaths: ["/tmp", "/var/tmp", "/dev/shm", "~/.cache"],
 	allow: [],
 	deny: [],
 	protectedPaths: [

@@ -140,7 +140,7 @@ test("parse: heredoc body skipped so trailing command lexes", () => {
 	// confirms the body did not poison the lexer with a spurious error.)
 	const { problem } = parse("cat <<'EOF'\nfoo(bar)\nEOF\necho hi");
 	assert.ok(problem?.includes("heredoc"));
-	assert.ok(!problem.includes("grouping"));
+	assert.ok(!problem!.includes("grouping"));
 });
 
 test("parse: unterminated heredoc fails closed", () => {
@@ -230,6 +230,43 @@ expectClass("(cd /tmp && ls)", "unknown"); // grouping unsupported
 expectClass("npm exec -- some-tool", "unknown"); // unlisted subcommand of mutating base
 expectClass("git bisect start", "mutating");
 expectClass("env FOO=1 node server.js", "unknown");
+
+// ---------------- shell builtins & keywords (regression: used to be unknown -> T0) ----------------
+
+// `cd` and other builtins must not taint an otherwise read-only compound command.
+expectClass("cd /home/user/project && ls -la", "readonly");
+expectClass("cd /tmp && echo hi && sed -n '1,10p' file.txt", "readonly");
+expectClass("cd /home/user/project && grep -rn foo src/", "readonly");
+expectClass("cd /home/user/project", "readonly");
+expectClass("pushd /tmp && popd", "readonly");
+expectClass("export FOO=bar && env", "readonly");
+
+// `cd` does not hide mutations in sibling segments.
+expectClass("cd /tmp && rm -rf build/", "mutating");
+expectClass("cd /home/user/project && git push origin main", "mutating");
+
+// Shell control keywords: the loop/cond body is analyzed, not the keyword.
+expectClass("for f in a b c; do echo $f; done", "readonly");
+expectClass("for f in a b c; do rm $f; done", "mutating");
+expectClass("if grep -q foo file; then echo yes; fi", "readonly");
+expectClass("if grep -q foo file; then rm file; fi", "mutating");
+expectClass("while read line; do echo $line; done < input.txt", "readonly");
+expectClass("{ rm -rf dist/; }", "mutating");
+expectClass("{ echo hi; }", "readonly");
+
+// `do`/`then` strip to the real command; bare keywords are readonly no-ops.
+test("parse: do keyword strips to real command", () => {
+	const { segments } = parse("do rm -rf dist/");
+	assert.equal(segments[0]!.binary, "rm");
+});
+test("parse: if keyword strips to real command", () => {
+	const { segments } = parse("if grep foo file");
+	assert.equal(segments[0]!.binary, "grep");
+});
+test("parse: bare then is a readonly no-op binary", () => {
+	const { segments } = parse("then");
+	assert.equal(segments[0]!.binary, "then");
+});
 
 // ---------------- hard blocks ----------------
 

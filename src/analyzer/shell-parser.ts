@@ -481,6 +481,11 @@ function redirectKind(text: string): Redirect["kind"] {
 	return "fd-dup"; // >& <&
 }
 
+/** Shell keywords that prefix a real command (`if grep x`, `do rm f`).
+ * Stripped by buildSegment so the following command is analyzed directly;
+ * also listed in command-db so a bare keyword token is a readonly no-op. */
+const PREFIX_KEYWORDS = new Set(["if", "elif", "while", "until", "do", "then", "else", "!", "{"]);
+
 function buildSegment(tokens: LexToken[], index: number, pendingProblem?: string): Segment {
 	const seg: Segment = {
 		index,
@@ -494,6 +499,7 @@ function buildSegment(tokens: LexToken[], index: number, pendingProblem?: string
 	};
 
 	let sawCommand = false;
+	let strippedPrefix: string | undefined;
 	for (const tok of tokens) {
 		seg.substitutions.push(...tok.subs);
 
@@ -509,6 +515,13 @@ function buildSegment(tokens: LexToken[], index: number, pendingProblem?: string
 		if (!sawCommand && isAssignment(tok.text)) {
 			const eq = tok.text.indexOf("=");
 			seg.env[tok.text.slice(0, eq)] = tok.text.slice(eq + 1);
+			continue;
+		}
+
+		// Strip leading shell keywords (`if`/`while`/`do`/`then`/...) so the real
+		// command becomes the binary. `if rm x` must classify on `rm`, not `if`.
+		if (!sawCommand && PREFIX_KEYWORDS.has(tok.text)) {
+			strippedPrefix = tok.text;
 			continue;
 		}
 
@@ -546,7 +559,13 @@ function buildSegment(tokens: LexToken[], index: number, pendingProblem?: string
 	}
 
 	if (!seg.binary) {
-		seg.problem = seg.problem ?? "no command word";
+		// A bare keyword segment (e.g. `then`/`done` with no body): treat the
+		// stripped/leading keyword as a readonly no-op rather than "no command".
+		if (strippedPrefix) {
+			seg.binary = strippedPrefix;
+		} else {
+			seg.problem = seg.problem ?? "no command word";
+		}
 	}
 	return seg;
 }

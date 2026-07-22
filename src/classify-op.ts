@@ -136,20 +136,36 @@ function opFromSegment(seg: Segment): OpKind | undefined {
 
 function pathsFromAnalysis(analysis: Analysis, cwd: string): string[] {
 	const paths: string[] = [];
+	// Track the effective cwd by following `cd`/`pushd` so relative pathspecs
+	// resolve where the command actually runs, not the session cwd.
+	let curCwd = cwd;
 	for (const seg of analysis.segments) {
+		if ((seg.binary === "cd" || seg.binary === "pushd") && !seg.problem && seg.subcommand) {
+			curCwd = resolveAgainst(seg.subcommand, curCwd);
+			continue;
+		}
 		for (const r of seg.redirects) {
-			if (r.kind === "write" && !isDevNull(r.target)) paths.push(resolveAgainst(r.target, cwd));
+			if (r.kind === "write" && !isDevNull(r.target)) paths.push(resolveAgainst(r.target, curCwd));
 		}
 		// Positional path-like args for common file ops.
 		if (seg.binary && (DELETE_BINS.has(seg.binary) || CREATE_BINS.has(seg.binary) || seg.binary === "mv" || seg.binary === "cp" || seg.binary === "chmod" || seg.binary === "chown")) {
 			for (const a of [...(seg.subcommand ? [seg.subcommand] : []), ...seg.args]) {
 				if (a.startsWith("-")) continue;
-				if (looksLikePath(a)) paths.push(resolveAgainst(a, cwd));
+				if (looksLikePath(a)) paths.push(resolveAgainst(a, curCwd));
 			}
 		}
 		if (seg.binary === "git" && seg.subcommand === "rm") {
 			for (const a of seg.args) {
-				if (!a.startsWith("-")) paths.push(resolveAgainst(a, cwd));
+				if (!a.startsWith("-")) paths.push(resolveAgainst(a, curCwd));
+			}
+		}
+		// `git add`/`git restore`/`git mv` pathspecs so tracked-file staging
+		// classifies on real paths (T2). `git add -A` (no path) stays T0.
+		if (seg.binary === "git" && (seg.subcommand === "add" || seg.subcommand === "restore" || seg.subcommand === "mv")) {
+			for (const a of seg.args) {
+				if (a.startsWith("-")) continue;
+				if (a === ".") paths.push(resolveAgainst(".", curCwd));
+				else if (looksLikePath(a)) paths.push(resolveAgainst(a, curCwd));
 			}
 		}
 	}

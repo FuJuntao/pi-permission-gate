@@ -3,7 +3,7 @@
  */
 
 import type { GateConfig, OpKind, Tier } from "./types.ts";
-import { matchAllowedFile, matchProtectedPath } from "./config.ts";
+import { matchAllowedFile, matchDisposablePath, matchProtectedPath } from "./config.ts";
 import { isGitIgnored, isGitTracked } from "./git-paths.ts";
 
 export interface TierResult {
@@ -58,6 +58,11 @@ export async function assignTier(
 async function tierForMutationPath(op: OpKind, path: string, config: GateConfig, cwd: string): Promise<TierResult> {
 	if (matchProtectedPath(config, path)) {
 		return { tier: "T1", reason: `${op} on protected path` };
+	}
+	// Disposable roots (e.g. /tmp): contents are safe to create/update/delete.
+	// The root itself is excluded (isWithin) so `rm -rf /tmp` stays gated.
+	if (matchDisposablePath(config, path)) {
+		return { tier: "T2", reason: `${op} on disposable path` };
 	}
 	if (await isGitIgnored(path, cwd)) {
 		return { tier: "T1", reason: `${op} on gitignored path` };

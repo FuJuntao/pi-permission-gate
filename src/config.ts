@@ -6,10 +6,10 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { matchPathGlob } from "./glob.ts";
-import { expandPath } from "./paths.ts";
+import { expandPath, isWithin } from "./paths.ts";
 import { matchWildcardList } from "./wildcard.ts";
 import { DEFAULT_CONFIG, type GateConfig, type Mode } from "./types.ts";
 
@@ -22,6 +22,7 @@ type PartialConfig = Partial<{
 	audit: boolean;
 	hardBlocksEnabled: boolean;
 	allowedFiles: string[];
+	disposablePaths: string[];
 	allow: string[];
 	deny: string[];
 	protectedPaths: string[];
@@ -55,6 +56,7 @@ function mergeLayer(base: GateConfig, layer: PartialConfig | undefined, source: 
 	merged.allow = [...new Set([...base.allow, ...stringList(layer.allow)])];
 	merged.deny = [...new Set([...base.deny, ...stringList(layer.deny)])];
 	merged.allowedFiles = [...new Set([...base.allowedFiles, ...stringList(layer.allowedFiles)])];
+	merged.disposablePaths = [...new Set([...base.disposablePaths, ...stringList(layer.disposablePaths)])];
 	const protectedExtra = [...stringList(layer.protectedPaths), ...stringList(layer.sensitivePaths)];
 	merged.protectedPaths = [...new Set([...base.protectedPaths, ...protectedExtra])];
 
@@ -109,6 +111,16 @@ export function matchProtectedPath(config: GateConfig, inputPath: string): strin
 
 export function matchAllowedFile(config: GateConfig, inputPath: string): string | undefined {
 	return matchPathGlob(config.allowedFiles, inputPath);
+}
+
+/** True for paths strictly beneath a disposable root (e.g. /tmp/foo, not /tmp). */
+export function matchDisposablePath(config: GateConfig, inputPath: string): string | undefined {
+	const normalized = resolve(expandPath(inputPath));
+	for (const raw of config.disposablePaths) {
+		const root = resolve(expandPath(raw));
+		if (isWithin(root, normalized)) return raw;
+	}
+	return undefined;
 }
 
 /** Append an allow rule to the global config file and the in-memory config. */
