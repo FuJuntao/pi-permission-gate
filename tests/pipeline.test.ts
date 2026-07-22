@@ -10,13 +10,24 @@ import { DEFAULT_CONFIG } from "../src/types.ts";
 
 const logPath = "/tmp/pi-permission-gate-pipeline-test.log";
 
-function decideBash(subject: string, overrides: Partial<typeof DEFAULT_CONFIG> = {}) {
+function decideBash(
+	subject: string,
+	overrides: Partial<typeof DEFAULT_CONFIG> = {},
+) {
 	return decide({
 		tool: "bash",
 		subject,
 		ctx: { cwd: "/repo", hasUI: true, isProjectTrusted: () => true } as never,
 		loaded: {
-			config: { ...DEFAULT_CONFIG, mode: "default", dryRun: true, audit: true, judgeModel: "", logPath, ...overrides },
+			config: {
+				...DEFAULT_CONFIG,
+				mode: "default",
+				dryRun: true,
+				audit: true,
+				judgeModel: "",
+				logPath,
+				...overrides,
+			},
 			globalPath: "/tmp/permission-gate.json",
 		},
 		cache: new Map(),
@@ -42,7 +53,10 @@ describe("pipeline", () => {
 	});
 
 	test("mode off is passthrough", async () => {
-		const decision = await decideBash("rm -rf /tmp/foo", { mode: "off", dryRun: false });
+		const decision = await decideBash("rm -rf /tmp/foo", {
+			mode: "off",
+			dryRun: false,
+		});
 		assert.equal(decision.verdict, "allow");
 		assert.equal(decision.stage, "off");
 	});
@@ -104,7 +118,13 @@ describe("auto-mode resolution (regression: cd/keywords no longer T0)", () => {
 			subject,
 			ctx: { cwd: root, hasUI: false, isProjectTrusted: () => true } as never,
 			loaded: {
-				config: { ...DEFAULT_CONFIG, mode: "auto", audit: false, judgeModel: "", logPath: join(root, "gate.log") },
+				config: {
+					...DEFAULT_CONFIG,
+					mode: "auto",
+					audit: false,
+					judgeModel: "",
+					logPath: join(root, "gate.log"),
+				},
 				globalPath: "/tmp/permission-gate.json",
 			},
 			cache: new Map(),
@@ -112,14 +132,18 @@ describe("auto-mode resolution (regression: cd/keywords no longer T0)", () => {
 	}
 
 	test("cd + read-only compound -> T2 allow (was T0 'unresolved operation kind')", async () => {
-		const d = await decideAuto(`cd ${root} && echo hi && sed -n '1,5p' tracked.txt`);
+		const d = await decideAuto(
+			`cd ${root} && echo hi && sed -n '1,5p' tracked.txt`,
+		);
 		assert.equal(d.verdict, "allow");
 		assert.equal(d.tier, "T2");
 		assert.equal(d.op, "read");
 	});
 
 	test("for/do/done read-only loop -> T2 allow (was T0)", async () => {
-		const d = await decideAuto(`cd ${root} && for f in tracked.txt; do echo $f; done`);
+		const d = await decideAuto(
+			`cd ${root} && for f in tracked.txt; do echo $f; done`,
+		);
 		assert.equal(d.verdict, "allow");
 		assert.equal(d.tier, "T2");
 		assert.equal(d.op, "read");
@@ -141,7 +165,9 @@ describe("auto-mode resolution (regression: cd/keywords no longer T0)", () => {
 	});
 
 	test("for loop with mutating body still resolves op (not 'unresolved')", async () => {
-		const d = await decideAuto(`cd ${root} && for f in tracked.txt; do rm $f; done`);
+		const d = await decideAuto(
+			`cd ${root} && for f in tracked.txt; do rm $f; done`,
+		);
 		assert.equal(d.op, "delete");
 		// rm $f: $f isn't a static path, so no resolvable path -> T0 (by design),
 		// but the op IS resolved (delete), not 'unresolved operation kind'.
@@ -164,7 +190,13 @@ describe("disposable paths (e.g. /tmp)", () => {
 			subject,
 			ctx: { cwd, hasUI: false, isProjectTrusted: () => true } as never,
 			loaded: {
-				config: { ...DEFAULT_CONFIG, mode: "auto", audit: false, judgeModel: "", logPath: "/tmp/pg-disposable-test.log" },
+				config: {
+					...DEFAULT_CONFIG,
+					mode: "auto",
+					audit: false,
+					judgeModel: "",
+					logPath: "/tmp/pg-disposable-test.log",
+				},
 				globalPath: "/tmp/permission-gate.json",
 			},
 			cache: new Map(),

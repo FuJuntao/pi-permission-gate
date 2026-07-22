@@ -11,14 +11,23 @@ import { matchHardBlock } from "../src/hard-blocks.ts";
 import { matchConfigRules, matchProtectedPath } from "../src/config.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 
-function expectClass(cmd: string, expected: "readonly" | "mutating" | "unknown") {
+function expectClass(
+	cmd: string,
+	expected: "readonly" | "mutating" | "unknown",
+) {
 	test(`classify ${JSON.stringify(cmd)} → ${expected}`, () => {
 		const a = classifyCommand(cmd);
 		assert.equal(
 			a.classification,
 			expected,
 			`got ${a.classification} (${a.note}); segments: ${JSON.stringify(
-				a.segments.map((s) => ({ bin: s.binary, sub: s.subcommand, flags: s.flags, args: s.args, problem: s.problem })),
+				a.segments.map((s) => ({
+					bin: s.binary,
+					sub: s.subcommand,
+					flags: s.flags,
+					args: s.args,
+					problem: s.problem,
+				})),
 			)}`,
 		);
 	});
@@ -129,8 +138,14 @@ test("parse: heredoc body not lexed as commands", () => {
 	for (const c of cases) {
 		const { problem } = parse(c);
 		assert.ok(problem, `expected a problem for ${JSON.stringify(c)}`);
-		assert.ok(problem!.includes("heredoc"), `expected 'heredoc' in problem, got: ${problem}`);
-		assert.ok(!problem!.includes("grouping"), `body should not be lexed; got: ${problem}`);
+		assert.ok(
+			problem!.includes("heredoc"),
+			`expected 'heredoc' in problem, got: ${problem}`,
+		);
+		assert.ok(
+			!problem!.includes("grouping"),
+			`body should not be lexed; got: ${problem}`,
+		);
 	}
 });
 
@@ -213,7 +228,7 @@ expectClass("ls; npm publish", "mutating");
 
 // ---------------- classifier: unknown (fail closed) ----------------
 
-expectClass("eval \"$SCRIPT\"", "unknown");
+expectClass('eval "$SCRIPT"', "unknown");
 expectClass("bash -c 'rm -rf dist/'", "mutating"); // -c body is analyzed
 expectClass("bash -c 'some opaque string with spaces and $VARS'", "unknown");
 expectClass("source ~/.bashrc", "unknown");
@@ -225,7 +240,7 @@ expectClass("python3 -c 'print(1)'", "unknown");
 expectClass("perl -pe 's/a/b/' file", "unknown");
 expectClass("ssh user@host 'uptime'", "unknown");
 expectClass("cat <<EOF\nhi\nEOF", "unknown"); // heredoc unsupported
-expectClass("echo \"unterminated", "unknown");
+expectClass('echo "unterminated', "unknown");
 expectClass("(cd /tmp && ls)", "unknown"); // grouping unsupported
 expectClass("npm exec -- some-tool", "unknown"); // unlisted subcommand of mutating base
 expectClass("git bisect start", "mutating");
@@ -286,26 +301,42 @@ test("parse: bare then is a readonly no-op binary", () => {
 test("hard block: rm -rf /", () => assert.ok(matchHardBlock("rm -rf /")));
 test("hard block: rm -rf /*", () => assert.ok(matchHardBlock("rm -rf /*")));
 test("hard block: rm -rf ~", () => assert.ok(matchHardBlock("rm -rf ~")));
-test("hard block: rm -rf $HOME", () => assert.ok(matchHardBlock("rm -rf $HOME")));
-test("hard block: rm -rf --no-preserve-root /", () => assert.ok(matchHardBlock("rm -rf --no-preserve-root /")));
+test("hard block: rm -rf $HOME", () =>
+	assert.ok(matchHardBlock("rm -rf $HOME")));
+test("hard block: rm -rf --no-preserve-root /", () =>
+	assert.ok(matchHardBlock("rm -rf --no-preserve-root /")));
 test("hard block: fork bomb", () => assert.ok(matchHardBlock(":(){ :|:& };:")));
-test("hard block: fork bomb spaced", () => assert.ok(matchHardBlock(": ( ) { : | : & } ; :")));
-test("hard block: mkfs /dev/sda", () => assert.ok(matchHardBlock("mkfs.ext4 /dev/sda1")));
-test("hard block: dd of=/dev/nvme", () => assert.ok(matchHardBlock("dd if=img.iso of=/dev/nvme0n1 bs=4M")));
-test("hard block: redirect to /dev/sda", () => assert.ok(matchHardBlock("cat img.iso > /dev/sda")));
-test("hard block: shred device", () => assert.ok(matchHardBlock("shred /dev/sdb")));
+test("hard block: fork bomb spaced", () =>
+	assert.ok(matchHardBlock(": ( ) { : | : & } ; :")));
+test("hard block: mkfs /dev/sda", () =>
+	assert.ok(matchHardBlock("mkfs.ext4 /dev/sda1")));
+test("hard block: dd of=/dev/nvme", () =>
+	assert.ok(matchHardBlock("dd if=img.iso of=/dev/nvme0n1 bs=4M")));
+test("hard block: redirect to /dev/sda", () =>
+	assert.ok(matchHardBlock("cat img.iso > /dev/sda")));
+test("hard block: shred device", () =>
+	assert.ok(matchHardBlock("shred /dev/sdb")));
 
 // these must NOT hard-block
-test("no hard block: rm -rf dist/", () => assert.equal(matchHardBlock("rm -rf dist/"), undefined));
-test("no hard block: rm -rf /tmp/build", () => assert.equal(matchHardBlock("rm -rf /tmp/build"), undefined));
-test("no hard block: rm -rf ~/tmp", () => assert.equal(matchHardBlock("rm -rf ~/tmp"), undefined));
-test("no hard block: dd of=file.img", () => assert.equal(matchHardBlock("dd if=/dev/zero of=file.img"), undefined));
-test("no hard block: ls /", () => assert.equal(matchHardBlock("ls /"), undefined));
+test("no hard block: rm -rf dist/", () =>
+	assert.equal(matchHardBlock("rm -rf dist/"), undefined));
+test("no hard block: rm -rf /tmp/build", () =>
+	assert.equal(matchHardBlock("rm -rf /tmp/build"), undefined));
+test("no hard block: rm -rf ~/tmp", () =>
+	assert.equal(matchHardBlock("rm -rf ~/tmp"), undefined));
+test("no hard block: dd of=file.img", () =>
+	assert.equal(matchHardBlock("dd if=/dev/zero of=file.img"), undefined));
+test("no hard block: ls /", () =>
+	assert.equal(matchHardBlock("ls /"), undefined));
 
 // ---------------- config rules ----------------
 
 test("config: deny beats allow", () => {
-	const cfg = { ...DEFAULT_CONFIG, allow: ["git *"], deny: ["git push *--force*"] };
+	const cfg = {
+		...DEFAULT_CONFIG,
+		allow: ["git *"],
+		deny: ["git push *--force*"],
+	};
 	assert.equal(matchConfigRules(cfg, "git status"), "allow");
 	assert.equal(matchConfigRules(cfg, "git push origin --force"), "deny");
 	assert.equal(matchConfigRules(cfg, "npm test"), undefined);
@@ -321,15 +352,23 @@ test("config: wildcard allow", () => {
 test("protected: ~/.ssh covers subtree", () => {
 	const home = process.env.HOME ?? "/home/user";
 	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "~/.ssh/id_rsa"), "~/.ssh");
-	assert.equal(matchProtectedPath(DEFAULT_CONFIG, `${home}/.ssh/config`), "~/.ssh");
+	assert.equal(
+		matchProtectedPath(DEFAULT_CONFIG, `${home}/.ssh/config`),
+		"~/.ssh",
+	);
 });
 
 test("protected: **/.env anywhere", () => {
 	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "/repo/app/.env"), "**/.env");
-	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "/repo/.env.production"), "**/.env.*");
+	assert.equal(
+		matchProtectedPath(DEFAULT_CONFIG, "/repo/.env.production"),
+		"**/.env.*",
+	);
 });
 
 test("protected: normal project file is fine", () => {
-	assert.equal(matchProtectedPath(DEFAULT_CONFIG, "/repo/src/index.ts"), undefined);
+	assert.equal(
+		matchProtectedPath(DEFAULT_CONFIG, "/repo/src/index.ts"),
+		undefined,
+	);
 });
-
