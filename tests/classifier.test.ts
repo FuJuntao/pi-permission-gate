@@ -231,6 +231,19 @@ expectClass("npm exec -- some-tool", "unknown"); // unlisted subcommand of mutat
 expectClass("git bisect start", "mutating");
 expectClass("env FOO=1 node server.js", "unknown");
 
+// ---------------- global flag before subcommand (e.g. `git -C <path>`) ----------------
+// A value-taking global flag used to hide the subcommand, falling back to the
+// readonly base (a false T2 allow for `git -C path push`). Re-derived now.
+expectClass("git -C /repo push origin main", "mutating");
+expectClass("git -C /repo commit -m wip", "mutating");
+expectClass("git -C /repo add file.txt", "mutating");
+expectClass("git -C /repo reset --hard", "mutating");
+expectClass("git -C /repo status", "readonly");
+expectClass("git -C /repo diff HEAD~3", "readonly");
+expectClass("git -C /repo log --oneline", "readonly");
+expectClass("git -C ~/repo show HEAD", "readonly");
+expectClass("git -C /repo --git-dir=/x status", "readonly");
+
 // ---------------- shell builtins & keywords (regression: used to be unknown -> T0) ----------------
 
 // `cd` and other builtins must not taint an otherwise read-only compound command.

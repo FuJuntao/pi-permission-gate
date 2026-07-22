@@ -37,6 +37,12 @@ function classify(input: string, depth: number): Analysis {
 		return { classification: "unknown", segments, separators, note: "empty command" };
 	}
 
+	// A global flag that takes a value (e.g. `git -C <path>`) pushes the real
+	// subcommand past the parser's subcommand slot, leaving seg.subcommand unset.
+	// Re-derive it from the positional args using the command's subcommand map so
+	// `git -C path push` classifies on `push` (mutating), not git's readonly base.
+	for (const seg of segments) deriveSubcommand(seg);
+
 	let sawMutating = false;
 	let sawUnknown = false;
 	const notes: string[] = [];
@@ -66,6 +72,28 @@ function classify(input: string, depth: number): Analysis {
 function segmentNote(seg: Segment, why: string): string {
 	const cmd = [seg.binary, seg.subcommand].filter(Boolean).join(" ");
 	return `${cmd || seg.raw} → ${why}${seg.problem ? ` (${seg.problem})` : ""}`;
+}
+
+/**
+ * Recover a hidden subcommand when a value-taking global flag (e.g. `git -C
+ * <path>`) pushed it into the positional args. Scans args for the first token
+ * that is a key in the command's subcommand map, skipping path/value tokens
+ * (contain `/` or `.`). Removes the match from args so path extraction isn't
+ * polluted. Net improvement: every `git -C <path> <mutating>` was a false T2.
+ */
+function deriveSubcommand(seg: Segment): void {
+	if (seg.subcommand || !seg.binary || seg.args.length === 0) return;
+	const map = lookupRule(seg.binary)?.subcommands;
+	if (!map) return;
+	for (let i = 0; i < seg.args.length; i++) {
+		const a = seg.args[i]!;
+		if (a.includes("/") || a.includes(".")) continue;
+		if (a in map) {
+			seg.subcommand = a;
+			seg.args.splice(i, 1);
+			return;
+		}
+	}
 }
 
 function classifySegment(seg: Segment, depth: number): "readonly" | "mutating" | "unknown" {

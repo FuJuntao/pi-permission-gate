@@ -147,6 +147,14 @@ describe("auto-mode resolution (regression: cd/keywords no longer T0)", () => {
 		// but the op IS resolved (delete), not 'unresolved operation kind'.
 		assert.notEqual(d.reason, "T0 auto-deny: unresolved operation kind");
 	});
+
+	test("git -C <path> push is not a false T2 allow (was readonly base)", async () => {
+		const d = await decideAuto(`git -C ${root} push origin main`);
+		// push is mutating; with no file path it can't be T2 (no readonly false-allow).
+		assert.notEqual(d.op, "read");
+		assert.notEqual(d.tier, "T2");
+		assert.equal(d.verdict, "block");
+	});
 });
 
 describe("disposable paths (e.g. /tmp)", () => {
