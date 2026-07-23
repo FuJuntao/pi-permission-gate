@@ -3,7 +3,11 @@
  */
 
 import type { GateConfig, OpKind, Tier } from "./types.ts";
-import { matchAllowedFile, matchDisposablePath, matchProtectedPath } from "./config.ts";
+import {
+	matchAllowedFile,
+	matchDisposablePath,
+	matchProtectedPath,
+} from "./config.ts";
 import { isGitIgnored, isGitTracked } from "./git-paths.ts";
 
 export interface TierResult {
@@ -55,7 +59,12 @@ export async function assignTier(
 	return worst;
 }
 
-async function tierForMutationPath(op: OpKind, path: string, config: GateConfig, cwd: string): Promise<TierResult> {
+async function tierForMutationPath(
+	op: OpKind,
+	path: string,
+	config: GateConfig,
+	cwd: string,
+): Promise<TierResult> {
 	if (matchProtectedPath(config, path)) {
 		return { tier: "T1", reason: `${op} on protected path` };
 	}
