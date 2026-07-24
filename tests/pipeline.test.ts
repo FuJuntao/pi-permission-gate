@@ -96,6 +96,34 @@ describe("pipeline", () => {
 		assert.equal(decision.tier, "T0");
 		assert.equal(decision.stage, "tier-t0");
 	});
+
+	test("web tools are classified as read-only and allowed", async () => {
+		for (const tool of ["web_search", "fetch_content", "get_search_content"]) {
+			const decision = await decide({
+				tool,
+				subject: '{"query":"test"}',
+				ctx: {
+					cwd: "/repo",
+					hasUI: true,
+					isProjectTrusted: () => true,
+				} as never,
+				loaded: {
+					config: {
+						...DEFAULT_CONFIG,
+						mode: "auto",
+						audit: false,
+						judgeModel: "",
+						logPath,
+					},
+					globalPath: "/tmp/permission-gate.json",
+				},
+				cache: new Map(),
+			});
+			assert.equal(decision.verdict, "allow");
+			assert.equal(decision.op, "read");
+			assert.equal(decision.tier, "T2");
+		}
+	});
 });
 
 describe("auto-mode resolution (regression: cd/keywords no longer T0)", () => {

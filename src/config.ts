@@ -23,6 +23,7 @@ type PartialConfig = Partial<{
 	hardBlocksEnabled: boolean;
 	allowedFiles: string[];
 	disposablePaths: string[];
+	readonlyTools: string[];
 	allow: string[];
 	deny: string[];
 	protectedPaths: string[];
@@ -57,6 +58,7 @@ function mergeLayer(base: GateConfig, layer: PartialConfig | undefined, source: 
 	merged.deny = [...new Set([...base.deny, ...stringList(layer.deny)])];
 	merged.allowedFiles = [...new Set([...base.allowedFiles, ...stringList(layer.allowedFiles)])];
 	merged.disposablePaths = [...new Set([...base.disposablePaths, ...stringList(layer.disposablePaths)])];
+	merged.readonlyTools = [...new Set([...base.readonlyTools, ...stringList(layer.readonlyTools)])];
 	const protectedExtra = [...stringList(layer.protectedPaths), ...stringList(layer.sensitivePaths)];
 	merged.protectedPaths = [...new Set([...base.protectedPaths, ...protectedExtra])];
 

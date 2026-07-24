@@ -105,6 +105,8 @@ export interface GateConfig {
 	logPath: string;
 	/** Judge request timeout in milliseconds. */
 	judgeTimeoutMs: number;
+	/** Tool names classified as read-only (op=read, no LLM judge needed). */
+	readonlyTools: string[];
 }
 
 export const DEFAULT_CONFIG: GateConfig = {
@@ -132,6 +134,12 @@ export const DEFAULT_CONFIG: GateConfig = {
 	],
 	logPath: "~/.pi/agent/permission-gate.log",
 	judgeTimeoutMs: 15000,
+	readonlyTools: [
+		"read", "grep", "find", "ls",
+		"web_search", "fetch_content", "get_search_content",
+		"symbol_search", "module_report", "read_symbol", "read_enclosing",
+		"lsp_diagnostics", "lens_diagnostics",
+	],
 };
 
 /** One JSONL record in the audit log. */

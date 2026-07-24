@@ -2,11 +2,15 @@
  * Permission Gate — CRUD + tier pipeline for pi tool calls.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { readAudit } from "./audit.ts";
 import { loadConfig, type LoadedConfig } from "./config.ts";
 import { decide } from "./pipeline.ts";
 import type { JudgeVerdict } from "./judge.ts";
+import { discoverReadonlyTools } from "./tool-heuristic.ts";
 import type { AuditEntry, Mode } from "./types.ts";
 
 const STATUS_KEY = "perm-gate";
@@ -15,13 +19,22 @@ const MODE_ICON: Record<Mode, string> = { default: "🛡", auto: "⚡", off: "�
 export default function (pi: ExtensionAPI) {
 	let loaded: LoadedConfig | undefined;
 	let sessionId: string | undefined;
+	let discoveredReadonly: string[] = [];
 	const judgeCache = new Map<string, JudgeVerdict>();
 
 	const reload = (ctx: ExtensionContext) => {
 		loaded = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+		// Union heuristically-discovered read-only tools on top of config.
+		// Discovery only ever adds — it never removes an explicitly-configured tool.
+		if (discoveredReadonly.length) {
+			loaded.config.readonlyTools = [
+				...new Set([...loaded.config.readonlyTools, ...discoveredReadonly]),
+			];
+		}
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		discoveredReadonly = discoverReadonlyTools(pi.getAllTools());
 		reload(ctx);
 		sessionId = ctx.sessionManager.getSessionId();
 		judgeCache.clear();
@@ -48,14 +61,20 @@ export default function (pi: ExtensionAPI) {
 		}
 		const judge = judgeModel ? " +judge" : " (no judge)";
 		const dry = dryRun ? " dry-run" : "";
-		ctx.ui.setStatus(STATUS_KEY, `${MODE_ICON[mode]} gate:${mode}${dry}${judge}`);
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			`${MODE_ICON[mode]} gate:${mode}${dry}${judge}`,
+		);
 	}
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (!loaded) reload(ctx);
 		const l = loaded!;
 
-		const subject = subjectFor(event.toolName, event.input as Record<string, unknown>);
+		const subject = subjectFor(
+			event.toolName,
+			event.input as Record<string, unknown>,
+		);
 		if (subject === undefined) return undefined;
 
 		const decision = await decide({
@@ -68,7 +87,10 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		if (decision.wouldBe === "block") {
-			ctx.ui.notify(`dry-run: would have blocked — ${decision.reason}`, "warning");
+			ctx.ui.notify(
+				`dry-run: would have blocked — ${decision.reason}`,
+				"warning",
+			);
 		}
 		if (decision.verdict === "block") {
 			return { block: true, reason: `permission-gate: ${decision.reason}` };
@@ -85,10 +107,14 @@ export default function (pi: ExtensionAPI) {
 			const nested = prefix.match(/^(mode|dry-run)\s+(.*)$/);
 			const command = nested?.[1];
 			const partial = nested?.[2] ?? prefix.trim();
-			const items = command === "mode" ? modes : command === "dry-run" ? onOff : subs;
+			const items =
+				command === "mode" ? modes : command === "dry-run" ? onOff : subs;
 			const filtered = items
 				.filter((item) => item.startsWith(partial))
-				.map((item) => ({ value: command ? `${command} ${item}` : item, label: item }));
+				.map((item) => ({
+					value: command ? `${command} ${item}` : item,
+					label: item,
+				}));
 			return filtered.length ? filtered : null;
 		},
 		handler: async (args, ctx) => {
@@ -100,22 +126,34 @@ export default function (pi: ExtensionAPI) {
 				case "mode": {
 					const next = rest[0] as Mode | undefined;
 					if (!next) {
-						ctx.ui.notify(`mode: ${l.config.mode} (usage: /gate mode default|auto|off)`, "info");
+						ctx.ui.notify(
+							`mode: ${l.config.mode} (usage: /gate mode default|auto|off)`,
+							"info",
+						);
 						return;
 					}
 					if (next !== "default" && next !== "auto" && next !== "off") {
-						ctx.ui.notify(`unknown mode '${next}' — use default|auto|off`, "error");
+						ctx.ui.notify(
+							`unknown mode '${next}' — use default|auto|off`,
+							"error",
+						);
 						return;
 					}
 					l.config.mode = next;
 					updateStatus(ctx);
-					ctx.ui.notify(`permission-gate mode → ${next} (session only; edit permission-gate.json to persist)`, "info");
+					ctx.ui.notify(
+						`permission-gate mode → ${next} (session only; edit permission-gate.json to persist)`,
+						"info",
+					);
 					return;
 				}
 				case "dry-run": {
 					const next = rest[0];
 					if (!next) {
-						ctx.ui.notify(`dry-run: ${l.config.dryRun ? "on" : "off"} (usage: /gate dry-run on|off)`, "info");
+						ctx.ui.notify(
+							`dry-run: ${l.config.dryRun ? "on" : "off"} (usage: /gate dry-run on|off)`,
+							"info",
+						);
 						return;
 					}
 					if (next !== "on" && next !== "off") {
@@ -124,12 +162,18 @@ export default function (pi: ExtensionAPI) {
 					}
 					l.config.dryRun = next === "on";
 					updateStatus(ctx);
-					ctx.ui.notify(`permission-gate dry-run → ${next} (session only)`, "info");
+					ctx.ui.notify(
+						`permission-gate dry-run → ${next} (session only)`,
+						"info",
+					);
 					return;
 				}
 				case "log": {
 					if (!l.config.audit) {
-						ctx.ui.notify(`audit is off — set "audit": true in permission-gate.json`, "info");
+						ctx.ui.notify(
+							`audit is off — set "audit": true in permission-gate.json`,
+							"info",
+						);
 						return;
 					}
 					const entries = readAudit(l.config.logPath, 50);
@@ -142,7 +186,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "stats": {
 					if (!l.config.audit) {
-						ctx.ui.notify(`audit is off — set "audit": true in permission-gate.json`, "info");
+						ctx.ui.notify(
+							`audit is off — set "audit": true in permission-gate.json`,
+							"info",
+						);
 						return;
 					}
 					const entries = readAudit(l.config.logPath, 2000);
@@ -170,8 +217,12 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-function subjectFor(tool: string, input: Record<string, unknown>): string | undefined {
-	if (tool === "bash") return typeof input.command === "string" ? input.command : undefined;
+function subjectFor(
+	tool: string,
+	input: Record<string, unknown>,
+): string | undefined {
+	if (tool === "bash")
+		return typeof input.command === "string" ? input.command : undefined;
 	if (tool === "write" || tool === "edit" || tool === "read") {
 		return typeof input.path === "string" ? input.path : undefined;
 	}
@@ -209,7 +260,8 @@ function showLog(entries: AuditEntry[], ctx: ExtensionContext) {
 			? ` judge:${e.judge.role}${e.judge.safe === false ? ":unsafe" : e.judge.safe === true ? ":safe" : ""}${e.judge.op ? `:${e.judge.op}` : ""}(${e.judge.ms}ms)`
 			: "";
 		const meta = [e.op, e.tier].filter(Boolean).join("/");
-		const subject = e.subject.length > 80 ? e.subject.slice(0, 77) + "…" : e.subject;
+		const subject =
+			e.subject.length > 80 ? e.subject.slice(0, 77) + "…" : e.subject;
 		return `${time} ${verdictMark(e)} [${e.stage}${meta ? ` ${meta}` : ""}] ${subject}${judge}`;
 	});
 	ctx.ui.notify(lines.join("\n"), "info");
@@ -239,6 +291,8 @@ function buildStats(entries: AuditEntry[]): string {
 		`${entries.length} decisions`,
 		`by verdict:\n${fmt(byVerdict)}`,
 		`by stage:\n${fmt(byStage)}`,
-		judgeRuns ? `judge: ${judgeRuns} runs, avg ${Math.round(judgeMs / judgeRuns)}ms` : "judge: no runs",
+		judgeRuns
+			? `judge: ${judgeRuns} runs, avg ${Math.round(judgeMs / judgeRuns)}ms`
+			: "judge: no runs",
 	].join("\n");
 }

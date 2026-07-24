@@ -7,13 +7,31 @@ import { classifyCommand } from "./analyzer/classifier.ts";
 import { pathExistsAsFile, resolvePath } from "./git-paths.ts";
 import { extractOpaqueSource, isOpaqueBinary } from "./opaque.ts";
 import { resolveAgainst } from "./paths.ts";
-import type { Analysis, OpKind, Segment } from "./types.ts";
+import type { Analysis, GateConfig, OpKind, Segment } from "./types.ts";
 
-const OP_RANK: Record<OpKind, number> = { delete: 3, update: 2, create: 1, read: 0 };
+const OP_RANK: Record<OpKind, number> = {
+	delete: 3,
+	update: 2,
+	create: 1,
+	read: 0,
+};
 
-const READONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
-const DELETE_BINS = new Set(["rm", "rmdir", "unlink", "shred", "wipefs", "blkdiscard"]);
-const CREATE_BINS = new Set(["mkdir", "touch", "mktemp", "install", "truncate"]);
+const BUILTIN_READONLY_TOOLS = ["read", "grep", "find", "ls"];
+const DELETE_BINS = new Set([
+	"rm",
+	"rmdir",
+	"unlink",
+	"shred",
+	"wipefs",
+	"blkdiscard",
+]);
+const CREATE_BINS = new Set([
+	"mkdir",
+	"touch",
+	"mktemp",
+	"install",
+	"truncate",
+]);
 
 export interface Classification {
 	op?: OpKind;
@@ -24,8 +42,14 @@ export interface Classification {
 	note: string;
 }
 
-export async function classifyToolCall(tool: string, subject: string, cwd: string): Promise<Classification> {
-	if (READONLY_TOOLS.has(tool)) {
+export async function classifyToolCall(
+	tool: string,
+	subject: string,
+	cwd: string,
+	config?: GateConfig,
+): Promise<Classification> {
+	const readonlyTools = new Set(config?.readonlyTools ?? BUILTIN_READONLY_TOOLS);
+	if (readonlyTools.has(tool)) {
 		const paths = subject ? [resolveAgainst(subject, cwd)] : [];
 		return { op: "read", paths, note: "read-only tool" };
 	}
@@ -38,7 +62,11 @@ export async function classifyToolCall(tool: string, subject: string, cwd: strin
 	if (tool === "write") {
 		const paths = [resolveAgainst(subject, cwd)];
 		const exists = await pathExistsAsFile(subject, cwd);
-		return { op: exists ? "update" : "create", paths, note: exists ? "write existing file" : "write new file" };
+		return {
+			op: exists ? "update" : "create",
+			paths,
+			note: exists ? "write existing file" : "write new file",
+		};
 	}
 
 	if (tool === "bash") {
@@ -56,13 +84,25 @@ export async function classifyToolCall(tool: string, subject: string, cwd: strin
 function classifyBash(subject: string, cwd: string): Classification {
 	const analysis = classifyCommand(subject);
 
-	if (analysis.classification === "unknown" || analysis.segments.some((s) => isOpaqueSegment(s))) {
+	if (
+		analysis.classification === "unknown" ||
+		analysis.segments.some((s) => isOpaqueSegment(s))
+	) {
 		const opaqueSource = extractOpaqueSource(subject, analysis, cwd);
 		if (opaqueSource) {
-			return { analysis, opaqueSource, paths: pathsFromAnalysis(analysis, cwd), note: "opaque invocation" };
+			return {
+				analysis,
+				opaqueSource,
+				paths: pathsFromAnalysis(analysis, cwd),
+				note: "opaque invocation",
+			};
 		}
 		if (analysis.classification === "unknown") {
-			return { analysis, paths: pathsFromAnalysis(analysis, cwd), note: analysis.note };
+			return {
+				analysis,
+				paths: pathsFromAnalysis(analysis, cwd),
+				note: analysis.note,
+			};
 		}
 	}
 
@@ -85,7 +125,12 @@ function classifyBash(subject: string, cwd: string): Classification {
 	}
 
 	if (analysis.classification === "readonly") {
-		return { op: "read", paths: pathsFromAnalysis(analysis, cwd), analysis, note: analysis.note };
+		return {
+			op: "read",
+			paths: pathsFromAnalysis(analysis, cwd),
+			analysis,
+			note: analysis.note,
+		};
 	}
 
 	if (!best && analysis.classification === "mutating") {
@@ -103,7 +148,10 @@ function classifyBash(subject: string, cwd: string): Classification {
 function isOpaqueSegment(seg: Segment): boolean {
 	if (!seg.binary) return Boolean(seg.problem);
 	if (isOpaqueBinary(seg.binary)) return true;
-	if (["eval", "exec", "source", ".", "sudo", "su", "doas"].includes(seg.binary)) return true;
+	if (
+		["eval", "exec", "source", ".", "sudo", "su", "doas"].includes(seg.binary)
+	)
+		return true;
 	return false;
 }
 
@@ -113,19 +161,55 @@ function opFromSegment(seg: Segment): OpKind | undefined {
 
 	if (DELETE_BINS.has(bin)) return "delete";
 	if (bin === "git" && seg.subcommand === "rm") return "delete";
-	if (bin === "git" && ["clean", "reset"].includes(seg.subcommand ?? "")) return "delete";
+	if (bin === "git" && ["clean", "reset"].includes(seg.subcommand ?? ""))
+		return "delete";
 
 	if (CREATE_BINS.has(bin)) return "create";
 	if (bin === "git" && seg.subcommand === "init") return "create";
 
 	if (bin === "mv" || bin === "cp") return "update";
-	if (bin === "sed" && (seg.flags.includes("-i") || seg.flags.includes("--in-place"))) return "update";
+	if (
+		bin === "sed" &&
+		(seg.flags.includes("-i") || seg.flags.includes("--in-place"))
+	)
+		return "update";
 	if (bin === "git") {
 		const sub = seg.subcommand ?? "";
-		if (["status", "diff", "log", "show", "ls-files", "branch", "remote", "rev-parse", "describe", "blame", "grep"].includes(sub)) {
+		if (
+			[
+				"status",
+				"diff",
+				"log",
+				"show",
+				"ls-files",
+				"branch",
+				"remote",
+				"rev-parse",
+				"describe",
+				"blame",
+				"grep",
+			].includes(sub)
+		) {
 			return "read";
 		}
-		if (["add", "commit", "checkout", "switch", "restore", "stash", "rebase", "merge", "cherry-pick", "pull", "fetch", "push", "tag", "config"].includes(sub)) {
+		if (
+			[
+				"add",
+				"commit",
+				"checkout",
+				"switch",
+				"restore",
+				"stash",
+				"rebase",
+				"merge",
+				"cherry-pick",
+				"pull",
+				"fetch",
+				"push",
+				"tag",
+				"config",
+			].includes(sub)
+		) {
 			return "update";
 		}
 	}
@@ -140,16 +224,32 @@ function pathsFromAnalysis(analysis: Analysis, cwd: string): string[] {
 	// resolve where the command actually runs, not the session cwd.
 	let curCwd = cwd;
 	for (const seg of analysis.segments) {
-		if ((seg.binary === "cd" || seg.binary === "pushd") && !seg.problem && seg.subcommand) {
+		if (
+			(seg.binary === "cd" || seg.binary === "pushd") &&
+			!seg.problem &&
+			seg.subcommand
+		) {
 			curCwd = resolveAgainst(seg.subcommand, curCwd);
 			continue;
 		}
 		for (const r of seg.redirects) {
-			if (r.kind === "write" && !isDevNull(r.target)) paths.push(resolveAgainst(r.target, curCwd));
+			if (r.kind === "write" && !isDevNull(r.target))
+				paths.push(resolveAgainst(r.target, curCwd));
 		}
 		// Positional path-like args for common file ops.
-		if (seg.binary && (DELETE_BINS.has(seg.binary) || CREATE_BINS.has(seg.binary) || seg.binary === "mv" || seg.binary === "cp" || seg.binary === "chmod" || seg.binary === "chown")) {
-			for (const a of [...(seg.subcommand ? [seg.subcommand] : []), ...seg.args]) {
+		if (
+			seg.binary &&
+			(DELETE_BINS.has(seg.binary) ||
+				CREATE_BINS.has(seg.binary) ||
+				seg.binary === "mv" ||
+				seg.binary === "cp" ||
+				seg.binary === "chmod" ||
+				seg.binary === "chown")
+		) {
+			for (const a of [
+				...(seg.subcommand ? [seg.subcommand] : []),
+				...seg.args,
+			]) {
 				if (a.startsWith("-")) continue;
 				if (looksLikePath(a)) paths.push(resolveAgainst(a, curCwd));
 			}
@@ -161,7 +261,12 @@ function pathsFromAnalysis(analysis: Analysis, cwd: string): string[] {
 		}
 		// `git add`/`git restore`/`git mv` pathspecs so tracked-file staging
 		// classifies on real paths (T2). `git add -A` (no path) stays T0.
-		if (seg.binary === "git" && (seg.subcommand === "add" || seg.subcommand === "restore" || seg.subcommand === "mv")) {
+		if (
+			seg.binary === "git" &&
+			(seg.subcommand === "add" ||
+				seg.subcommand === "restore" ||
+				seg.subcommand === "mv")
+		) {
 			for (const a of seg.args) {
 				if (a.startsWith("-")) continue;
 				if (a === ".") paths.push(resolveAgainst(".", curCwd));
@@ -177,11 +282,19 @@ function looksLikePath(s: string): boolean {
 }
 
 function isDevNull(target: string): boolean {
-	return target === "/dev/null" || target === "/dev/stdout" || target === "/dev/stderr" || target.startsWith("/dev/fd/");
+	return (
+		target === "/dev/null" ||
+		target === "/dev/stdout" ||
+		target === "/dev/stderr" ||
+		target.startsWith("/dev/fd/")
+	);
 }
 
 /** Re-export for tests. */
-export async function resolveExisting(path: string, cwd: string): Promise<string> {
+export async function resolveExisting(
+	path: string,
+	cwd: string,
+): Promise<string> {
 	if (existsSync(resolveAgainst(path, cwd))) return resolvePath(path, cwd);
 	return resolveAgainst(path, cwd);
 }

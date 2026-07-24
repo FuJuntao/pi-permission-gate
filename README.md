@@ -29,7 +29,7 @@ tool_call
 ### Operation kinds (CRUD)
 
 | Kind | Meaning | Examples |
-|------|---------|----------|
+| ------ | --------- | ---------- |
 | **C** Create | Creates a new file/dir/resource | `write` new path, `mkdir`, `touch` |
 | **R** Read | Observes without changing state | `read`, `grep`, `ls`, `cat`, `git status` |
 | **U** Update | Modifies existing content/state | `edit`, `sed -i`, overwrite `write` |
@@ -79,7 +79,7 @@ tool subject (command string or path).
 ### Tiers
 
 | Tier | Meaning |
-|------|---------|
+| ------ | --------- |
 | **T2** | Pass — no judge, no prompt |
 | **T1** | LLM judge decides |
 | **T0** | No judge — human prompt (`default`) or auto-deny (`auto`) |
@@ -100,7 +100,7 @@ is **T1**. **C** and **R** use the `allowedFiles` rules below.
 ### Create and Read
 
 | Op | Path matches `allowedFiles` | No match |
-|----|------------------------------|----------|
+| ---- | ------------------------------ | ---------- |
 | **R** | T2 | T0 |
 | **C** | T2 | T0 |
 
@@ -130,7 +130,7 @@ When a human decision is required, options are:
 ## Modes
 
 | Mode | T2 | T1 | T0 | Human attention |
-|------|----|----|-----|-----------------|
+| ------ | ---- | ---- | ----- | ----------------- |
 | **default** | Pass | Judge → allow **or prompt** | Always prompt | When needed |
 | **auto** | Pass | Judge → allow **or deny** | Auto-deny | None |
 | **off** | — | — | — | None (passthrough) |
@@ -148,7 +148,7 @@ judge behavior, records what the verdict **would be**, and only enforces
 hard blocks.
 
 | Combo | What you are testing |
-|-------|----------------------|
+| ------- | ---------------------- |
 | `default` | live interactive gate |
 | `auto` | live unattended gate |
 | `default` + `dryRun` | would prompt vs allow under default |
@@ -173,7 +173,7 @@ Three layers, merged in order (later wins; project may tighten but not
 loosen global guards):
 
 | Layer | Path |
-|-------|------|
+| ------- | ------ |
 | Defaults | built into the extension |
 | Global | `~/.pi/agent/permission-gate.json` |
 | Project | `<cwd>/.pi/permission-gate.json` (trusted projects only) |
@@ -202,6 +202,12 @@ loosen global guards):
   // Files the agent may freely create/read (glob patterns).
   // Updates/deletes on these paths are also easier to auto-approve when git-tracked.
   "allowedFiles": ["**/*"],
+
+  // Tool names treated as read-only (op=read → T2 → allow, no LLM judge).
+  // Most read-only tools are auto-discovered from pi tool metadata at
+  // session start; use this only to force-classify a tool the heuristic
+  // missed (e.g. an unusually-named query tool). Merges additively.
+  "readonlyTools": ["my_custom_query_tool"],
 
   // Always allow matching commands or paths (wildcard patterns).
   "allow": ["git status", "git diff *"],
@@ -235,8 +241,8 @@ loosen global guards):
 **Always allow / Always allow similar** always append to the **global**
 `allow` list, even when a project config layer is present.
 
-Lists (`allow`, `deny`, `allowedFiles`, `protectedPaths`) merge as
-additive unions across layers. Project config may enable
+Lists (`allow`, `deny`, `allowedFiles`, `protectedPaths`, `readonlyTools`)
+merge as additive unions across layers. Project config may enable
 `hardBlocksEnabled` when the merged global value is false; it cannot
 disable hard blocks that the global layer left enabled. Project config may
 set `mode` to `default` or `auto`, but only the global layer may set
@@ -270,14 +276,24 @@ Mode `off` produces no audit entries.
 ## Tool coverage
 
 | Tool | Handling |
-|------|----------|
+| ------ | ---------- |
 | `bash` | classify via shell analyzer → full pipeline |
 | `bash` opaque (`python` / `node` / nested scripts, …) | load source → judge classifies op kind → tier matrix |
+| read-only tools (auto-discovered + `readonlyTools`) | **R** → T2 allow, no judge |
 | `read` / `grep` / `find` / `ls` | **R** → tier by `allowedFiles` glob |
 | `write` (new path) | **C** → tier by `allowedFiles` glob |
 | `write` (existing) / `edit` | **U** → path tiering |
 | delete-like bash (`rm`, …) | **D** → path tiering |
 | unknown / custom tools | recover input body when possible → same opaque path; else T0 |
+
+Read-only tools are discovered at session start from pi tool metadata
+(`pi.getAllTools()`): a tool qualifies when its name matches a read-only
+pattern (`read`, `search`, `query`, `get`, `find`, `diagnostics`, …), does
+not match any mutation pattern (`write`, `edit`, `execute`, `replace`, …),
+and carries no mutation-indicating parameters (`content`, `command`,
+`edits`, `config`, `message`). Anything uncertain is left unclassified and
+falls through to the opaque/judge path. Use `readonlyTools` to
+force-classify a tool the heuristic misses.
 
 ## Decision matrix (summary)
 

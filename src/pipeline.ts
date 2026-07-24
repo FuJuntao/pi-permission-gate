@@ -128,7 +128,7 @@ export async function decide(input: GateInput): Promise<Decision> {
 	}
 
 	// ---- Classify ----
-	const classified = await classifyToolCall(tool, subject, ctx.cwd);
+	const classified = await classifyToolCall(tool, subject, ctx.cwd, config);
 	analysis = classified.analysis;
 	op = classified.op;
 	let paths = classified.paths;
